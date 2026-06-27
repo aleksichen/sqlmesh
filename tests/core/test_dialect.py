@@ -760,6 +760,13 @@ def test_sqlglot_extended_correctly(dialect: str) -> None:
     assert ast.sql(dialect=dialect) == "MODEL (\nname foo\n)"
 
 
+def test_maxcompute_dialect_alias_extends_sqlmesh_model_syntax() -> None:
+    ast = d.parse_one("MODEL (name analytics.orders)", dialect="maxcompute")
+    assert isinstance(ast, d.Model)
+    assert ast.sql(dialect="maxcompute") == "MODEL (\nname analytics.orders\n)"
+    assert exp.DataType.build("string", dialect="maxcompute").sql(dialect="maxcompute") == "STRING"
+
+
 def test_connected_identifier():
     ast = d.parse_one("""SELECT ("x"at time zone 'utc')::timestamp as x""", "redshift")
     assert ast.sql("redshift") == """SELECT CAST(("x" AT TIME ZONE 'utc') AS TIMESTAMP) AS x"""

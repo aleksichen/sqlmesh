@@ -21,6 +21,7 @@ from sqlmesh.core.engine_adapter.trino import TrinoEngineAdapter
 from sqlmesh.core.engine_adapter.athena import AthenaEngineAdapter
 from sqlmesh.core.engine_adapter.risingwave import RisingwaveEngineAdapter
 from sqlmesh.core.engine_adapter.fabric import FabricEngineAdapter
+from sqlmesh.core.engine_adapter.maxcompute import MaxComputeEngineAdapter
 
 DIALECT_TO_ENGINE_ADAPTER = {
     "hive": SparkEngineAdapter,
@@ -39,6 +40,7 @@ DIALECT_TO_ENGINE_ADAPTER = {
     "risingwave": RisingwaveEngineAdapter,
     "fabric": FabricEngineAdapter,
     "starrocks": StarRocksEngineAdapter,
+    "maxcompute": MaxComputeEngineAdapter,
 }
 
 DIALECT_ALIASES = {

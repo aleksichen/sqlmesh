@@ -19,6 +19,7 @@ from sqlmesh.core.config.connection import (
     DuckDBConnectionConfig,
     FabricConnectionConfig,
     GCPPostgresConnectionConfig,
+    MaxComputeConnectionConfig,
     MotherDuckConnectionConfig,
     MSSQLConnectionConfig,
     MySQLConnectionConfig,
@@ -1352,6 +1353,57 @@ def test_athena_s3_locations_valid(make_config):
     assert isinstance(config, AthenaConnectionConfig)
     assert config.s3_staging_dir is None
     assert config.s3_warehouse_location is None
+
+
+def test_maxcompute_connection_config(make_config):
+    from sqlmesh.core.config import MaxComputeConnectionConfig as PublicMaxComputeConnectionConfig
+
+    config = make_config(
+        type="maxcompute",
+        project="warehouse",
+        schema="analytics",
+        endpoint="https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+        access_key_id="ak",
+        access_key_secret="sk",
+        security_token="token",
+        tunnel_endpoint="https://dt.cn-hangzhou.maxcompute.aliyun.com",
+        quota_name="default",
+        sql_hints={"odps.sql.allow.fullscan": "true"},
+        check_import=False,
+    )
+
+    assert isinstance(config, MaxComputeConnectionConfig)
+    assert PublicMaxComputeConnectionConfig is MaxComputeConnectionConfig
+    assert config.type_ == "maxcompute"
+    assert config.DIALECT == "maxcompute"
+    assert config.concurrent_tasks == 1
+    assert config.register_comments is False
+    assert config.pre_ping is False
+    assert config.get_catalog() == "warehouse"
+    assert config.is_recommended_for_state_sync is False
+    assert config.is_forbidden_for_state_sync is True
+
+    kwargs = config._static_connection_kwargs
+    assert kwargs["project"] == "warehouse"
+    assert kwargs["schema"] == "analytics"
+    assert kwargs["endpoint"] == "https://service.cn-hangzhou.maxcompute.aliyun.com/api"
+    assert kwargs["tunnel_endpoint"] == "https://dt.cn-hangzhou.maxcompute.aliyun.com"
+    assert kwargs["hints"] == {"odps.sql.allow.fullscan": "true"}
+    assert kwargs["quota_name"] == "default"
+    assert "security_token" not in kwargs
+
+
+def test_maxcompute_rejects_maxqa_execution_mode(make_config):
+    with pytest.raises(ConfigError, match="execution_mode"):
+        make_config(
+            type="maxcompute",
+            project="warehouse",
+            endpoint="https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+            access_key_id="ak",
+            access_key_secret="sk",
+            execution_mode="maxqa",
+            check_import=False,
+        )
 
 
 def test_databricks(make_config):

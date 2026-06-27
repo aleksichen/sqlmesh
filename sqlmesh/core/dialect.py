@@ -12,7 +12,7 @@ from functools import lru_cache
 
 from sqlglot import Dialect, Generator, ParseError, Parser, Tokenizer, TokenType, exp
 from sqlglot.dialects.dialect import DialectType
-from sqlglot.dialects import DuckDB, Snowflake, TSQL
+from sqlglot.dialects import DuckDB, Hive, Snowflake, TSQL
 import sqlglot.dialects.athena as athena
 import sqlglot.generators.athena as athena_generators
 from sqlglot.parsers.athena import AthenaTrinoParser
@@ -118,6 +118,10 @@ class StagedFilePath(exp.Expression):
     """Represents paths to "staged files" in Snowflake."""
 
     arg_types = exp.Table.arg_types.copy()
+
+
+class MaxCompute(Hive):
+    pass
 
 
 def _parse_statement(self: Parser) -> t.Optional[exp.Expr]:

@@ -84,6 +84,7 @@ nav:
       - integrations/engines/databricks.md
       - integrations/engines/duckdb.md
       - integrations/engines/fabric.md
+      - integrations/engines/maxcompute.md
       - integrations/engines/motherduck.md
       - integrations/engines/mssql.md
       - integrations/engines/mysql.md

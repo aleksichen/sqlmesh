@@ -1900,6 +1900,44 @@ def test_snapshot_evaluator_yield_empty_pd(adapter_mock, make_snapshot):
     adapter_mock.insert_overwrite_by_time_partition.assert_not_called()
 
 
+def test_incremental_by_time_range_passes_partitioned_by_to_adapter() -> None:
+    model = load_sql_based_model(
+        d.parse(
+            """
+            MODEL (
+              name analytics.fact_order_daily,
+              kind INCREMENTAL_BY_TIME_RANGE (
+                time_column ds
+              ),
+              partitioned_by [ds],
+              dialect maxcompute
+            );
+
+            SELECT 1 AS order_id, '2026-06-27' AS ds;
+            """
+        )
+    )
+    adapter = Mock()
+    adapter.columns.return_value = {
+        "order_id": exp.DataType.build("BIGINT"),
+        "ds": exp.DataType.build("STRING"),
+    }
+    strategy = IncrementalByTimeRangeStrategy(adapter)
+
+    strategy.insert(
+        table_name="analytics.fact_order_daily",
+        query_or_df=parse_one("SELECT 1 AS order_id, '2026-06-27' AS ds"),
+        model=model,
+        is_first_insert=False,
+        render_kwargs={},
+        start="2026-06-27",
+        end="2026-06-27",
+    )
+
+    partitioned_by = adapter.insert_overwrite_by_time_partition.call_args.kwargs["partitioned_by"]
+    assert [partition.name for partition in partitioned_by] == ["ds"]
+
+
 def test_create_clone_in_dev(mocker: MockerFixture, adapter_mock, make_snapshot):
     adapter_mock.SUPPORTS_CLONING = True
     adapter_mock.get_alter_operations.return_value = []

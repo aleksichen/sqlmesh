@@ -2328,6 +2328,7 @@ class IncrementalByTimeRangeStrategy(IncrementalStrategy):
             time_column=model.time_column,
             target_columns_to_types=columns_to_types,
             source_columns=source_columns,
+            partitioned_by=model.partitioned_by,
             **kwargs,
         )
 

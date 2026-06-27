@@ -57,6 +57,7 @@ FORBIDDEN_STATE_SYNC_ENGINES = {
     # Do not support row-level operations
     "spark",
     "trino",
+    "maxcompute",
     # Nullable types are problematic
     "clickhouse",
     "starrocks",
@@ -2453,6 +2454,85 @@ class AthenaConnectionConfig(ConnectionConfig):
 
     def get_catalog(self) -> t.Optional[str]:
         return self.catalog_name
+
+
+class _DeferredStsAccount:
+    def __init__(self, access_id: t.Optional[str], secret_access_key: t.Optional[str], token: str):
+        self.access_id = access_id
+        self.secret_access_key = secret_access_key
+        self.sts_token = token
+
+
+class MaxComputeConnectionConfig(ConnectionConfig):
+    project: str
+    schema_: t.Optional[str] = Field(alias="schema", default=None)
+    endpoint: str
+    access_key_id: t.Optional[str] = None
+    access_key_secret: t.Optional[str] = None
+    security_token: t.Optional[str] = None
+    tunnel_endpoint: t.Optional[str] = None
+    quota_name: t.Optional[str] = None
+    execution_mode: t.Literal["offline"] = "offline"
+    sql_hints: t.Dict[str, str] = Field(default_factory=dict)
+
+    concurrent_tasks: int = 1
+    register_comments: t.Literal[False] = False
+    pre_ping: t.Literal[False] = False
+
+    type_: t.Literal["maxcompute"] = Field(alias="type", default="maxcompute")
+    DIALECT: t.ClassVar[t.Literal["maxcompute"]] = "maxcompute"
+    DISPLAY_NAME: t.ClassVar[t.Literal["MaxCompute"]] = "MaxCompute"
+    DISPLAY_ORDER: t.ClassVar[t.Literal[19]] = 19
+
+    _engine_import_validator = _get_engine_import_validator("odps", "maxcompute")
+
+    @property
+    def _connection_kwargs_keys(self) -> t.Set[str]:
+        return set()
+
+    @property
+    def _engine_adapter(self) -> t.Type[EngineAdapter]:
+        return engine_adapter.MaxComputeEngineAdapter
+
+    @property
+    def _connection_factory(self) -> t.Callable:
+        def connect(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            from odps.dbapi import connect as odps_connect
+
+            return odps_connect(*args, **kwargs)
+
+        return connect
+
+    @property
+    def _static_connection_kwargs(self) -> t.Dict[str, t.Any]:
+        kwargs: t.Dict[str, t.Any] = {
+            "project": self.project,
+            "endpoint": self.endpoint,
+            "schema": self.schema_,
+            "tunnel_endpoint": self.tunnel_endpoint,
+            "hints": dict(self.sql_hints),
+            "quota_name": self.quota_name,
+        }
+        if self.security_token:
+            kwargs["account"] = self._sts_account()
+        else:
+            kwargs["access_id"] = self.access_key_id
+            kwargs["secret_access_key"] = self.access_key_secret
+        return {key: value for key, value in kwargs.items() if value is not None}
+
+    def _sts_account(self) -> t.Any:
+        try:
+            from odps.accounts import StsAccount
+        except ImportError:
+            return _DeferredStsAccount(
+                self.access_key_id,
+                self.access_key_secret,
+                self.security_token or "",
+            )
+        return StsAccount(self.access_key_id, self.access_key_secret, self.security_token)
+
+    def get_catalog(self) -> t.Optional[str]:
+        return self.project
 
 
 class RisingwaveConnectionConfig(ConnectionConfig):

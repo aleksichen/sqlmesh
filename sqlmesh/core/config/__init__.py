@@ -15,6 +15,7 @@ from sqlmesh.core.config.connection import (
     DuckDBConnectionConfig as DuckDBConnectionConfig,
     FabricConnectionConfig as FabricConnectionConfig,
     GCPPostgresConnectionConfig as GCPPostgresConnectionConfig,
+    MaxComputeConnectionConfig as MaxComputeConnectionConfig,
     MotherDuckConnectionConfig as MotherDuckConnectionConfig,
     MSSQLConnectionConfig as MSSQLConnectionConfig,
     MySQLConnectionConfig as MySQLConnectionConfig,
