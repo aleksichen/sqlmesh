@@ -2,6 +2,27 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` to implement this plan task-by-task. The implementing AI must complete all tasks in one pass, summarize the result, and then wait for Claude to perform code review. Do not create a worktree; make changes on the current branch.
 
+## Current Implementation Status（2026-06-28）
+
+This plan has been implemented on the current branch. The original TDD task breakdown is kept below for traceability; this status section records the effective behavior of the latest code.
+
+- Implemented `MaxComputeEngineAdapter`, `MaxComputeConnectionConfig`, adapter registration, local `maxcompute` dialect alias, optional `pyodps` dependency, pytest marker, and user docs.
+- Implemented DDL/DML paths for `CREATE/DROP SCHEMA`, `CREATE/DROP TABLE`, `CREATE OR REPLACE VIEW`, `CTAS`, `INSERT INTO`, unpartitioned `INSERT OVERWRITE TABLE`, and partitioned `INSERT OVERWRITE TABLE ... PARTITION (...)`.
+- Implemented MaxCompute no-schema namespace handling: `CREATE/DROP SCHEMA` no-op, logical schema folded into object names as `schema__table`, physical table names folded the same way, and PyODPS metadata calls use `project=...` with `schema=None`.
+- Implemented PyODPS metadata paths for `columns`, `table_exists`, and `_get_data_objects`; no `DESCRIBE` text parsing is used.
+- Implemented `lifecycle` extraction from table properties and rendering as `LIFECYCLE n`.
+- Implemented projection reordering by moving existing select expressions, preserving computed aliases such as `price * quantity AS amount`.
+- Implemented non-partitioned FULL overwrite without a MaxCompute overwrite column list, matching positional overwrite semantics.
+- Implemented `where` handling through SQLMesh projection/filter wrapping so alias filters are applied outside the projected subquery.
+- Implemented a gated real MaxCompute no-schema `Context.plan()` + repeated `Context.apply()` smoke test using DuckDB state.
+
+Known boundaries in the latest code:
+
+- `execution_mode` is currently `Literal["offline"]`; `maxqa` / MCQA is intentionally rejected.
+- `partitioned_by` only accepts simple column references; transform partitions such as `DATE(ds)` are rejected.
+- MaxCompute state sync, Python models, pandas DataFrame writes, materialized views, SCD Type 2, grants, and atomic full table replacement remain out of scope.
+- The real integration smoke currently covers no-schema namespace projects. Schema namespace enabled projects retain code support but still need a dedicated real smoke.
+
 **Goal:** Add a built-in SQLMesh `maxcompute` execution adapter that can plan and apply supported offline SQL models against Alibaba Cloud MaxCompute/ODPS while keeping SQLMesh state in an external state backend.
 
 **Architecture:** Add a first-party `MaxComputeEngineAdapter` with explicit MaxCompute DDL/DML rendering for table, view, CTAS fallback, insert append, and partition overwrite paths. Add a `MaxComputeConnectionConfig` that lazily imports PyODPS DBAPI, maps SQLMesh config fields to PyODPS connection parameters, and forbids MaxCompute as a state sync engine. Use PyODPS object APIs for metadata instead of parsing `DESCRIBE` output.
@@ -22,6 +43,7 @@
 - Unit tests using mocked adapter and mocked PyODPS objects.
 - A gated real MaxCompute smoke test fixture that runs only when credentials are present.
 - Documentation for supported workflows and state connection separation.
+- No-schema namespace projects, by folding logical SQLMesh schemas into MaxCompute object names.
 
 ## Out Of Scope
 
@@ -34,6 +56,8 @@
 - Automatic conversion from arbitrary SQL dialects to MaxCompute SQL.
 - Cross-project catalog behavior beyond mapping `project` to default catalog.
 - MaxCompute project/user/role administration.
+- MaxQA/MCQA execution mode.
+- Transform partition expressions such as `DATE(ds)`.
 
 ## Reference Notes
 
@@ -296,8 +320,8 @@ class MaxComputeConnectionConfig(ConnectionConfig):
     security_token: t.Optional[str] = None
     tunnel_endpoint: t.Optional[str] = None
     quota_name: t.Optional[str] = None
-    execution_mode: t.Literal["offline", "maxqa"] = "offline"
-    sql_hints: t.Dict[str, str] = {}
+    execution_mode: t.Literal["offline"] = "offline"
+    sql_hints: t.Dict[str, str] = Field(default_factory=dict)
 
     concurrent_tasks: int = 1
     register_comments: t.Literal[False] = False
@@ -882,7 +906,7 @@ Expected: PASS.
 - Modify: `sqlmesh/core/engine_adapter/maxcompute.py`
 - Modify: `sqlmesh/core/snapshot/evaluator.py`
 - Test: `tests/core/engine_adapter/test_maxcompute.py`
-- Test: `tests/core/snapshot/test_evaluator.py`
+- Test: `tests/core/test_snapshot_evaluator.py`
 - Delete: none
 
 - [ ] **Step 1: Write the failing test**
@@ -921,7 +945,7 @@ def test_maxcompute_time_partition_overwrite_routes_to_partition_clause(adapter:
 Add evaluator routing test:
 
 ```python
-# tests/core/snapshot/test_evaluator.py
+# tests/core/test_snapshot_evaluator.py
 from unittest.mock import Mock
 
 from sqlglot import exp, parse_one
@@ -971,7 +995,7 @@ def test_incremental_by_time_range_passes_partitioned_by_to_adapter() -> None:
 Run:
 
 ```bash
-pytest tests/core/engine_adapter/test_maxcompute.py::test_maxcompute_time_partition_overwrite_routes_to_partition_clause tests/core/snapshot/test_evaluator.py::test_incremental_by_time_range_passes_partitioned_by_to_adapter -v
+pytest tests/core/engine_adapter/test_maxcompute.py::test_maxcompute_time_partition_overwrite_routes_to_partition_clause tests/core/test_snapshot_evaluator.py::test_incremental_by_time_range_passes_partitioned_by_to_adapter -v
 ```
 
 Expected: FAIL because `_insert_overwrite_by_time_partition` currently delegates to condition overwrite and `IncrementalByTimeRangeStrategy.insert` does not pass `model.partitioned_by` into `insert_overwrite_by_time_partition`.
@@ -1042,7 +1066,7 @@ class MaxComputeEngineAdapter(EngineAdapter):
 Run:
 
 ```bash
-pytest tests/core/engine_adapter/test_maxcompute.py::test_maxcompute_time_partition_overwrite_routes_to_partition_clause tests/core/snapshot/test_evaluator.py::test_incremental_by_time_range_passes_partitioned_by_to_adapter -v
+pytest tests/core/engine_adapter/test_maxcompute.py::test_maxcompute_time_partition_overwrite_routes_to_partition_clause tests/core/test_snapshot_evaluator.py::test_incremental_by_time_range_passes_partitioned_by_to_adapter -v
 ```
 
 Expected: PASS.
@@ -1307,11 +1331,13 @@ Add a gated integration test:
 ```python
 # tests/core/engine_adapter/integration/test_integration_maxcompute.py
 import os
+import re
+import uuid
 
 import pytest
 
 from sqlmesh.core.config import Config, GatewayConfig, ModelDefaultsConfig
-from sqlmesh.core.config.connection import MaxComputeConnectionConfig, PostgresConnectionConfig
+from sqlmesh.core.config.connection import DuckDBConnectionConfig, MaxComputeConnectionConfig
 from sqlmesh.core.context import Context
 
 pytestmark = [pytest.mark.maxcompute, pytest.mark.integration]
@@ -1325,22 +1351,23 @@ def _has_maxcompute_env() -> bool:
             "MAXCOMPUTE_ENDPOINT",
             "MAXCOMPUTE_ACCESS_KEY_ID",
             "MAXCOMPUTE_ACCESS_KEY_SECRET",
-            "SQLMESH_STATE_HOST",
-            "SQLMESH_STATE_USER",
-            "SQLMESH_STATE_PASSWORD",
-            "SQLMESH_STATE_DATABASE",
         )
     )
 
 
 @pytest.mark.skipif(not _has_maxcompute_env(), reason="MaxCompute smoke credentials are not configured")
-def test_maxcompute_smoke_plan_apply(tmp_path) -> None:
+def test_maxcompute_no_schema_smoke_plan_apply(tmp_path) -> None:
+    project = os.environ["MAXCOMPUTE_PROJECT"]
+    model_prefix = f"sqlmesh_smoke_{uuid.uuid4().hex[:8]}"
+    dim_model = f"{model_prefix}_dim_customer"
+    fact_model = f"{model_prefix}_fact_order_daily"
+
     models_dir = tmp_path / "models"
     models_dir.mkdir()
     (models_dir / "dim_customer.sql").write_text(
-        """
+        f"""
         MODEL (
-          name analytics.dim_customer,
+          name analytics.{dim_model},
           kind FULL,
           dialect maxcompute,
           physical_properties (lifecycle = 1)
@@ -1351,30 +1378,31 @@ def test_maxcompute_smoke_plan_apply(tmp_path) -> None:
         encoding="utf-8",
     )
     (models_dir / "fact_order_daily.sql").write_text(
-        """
+        f"""
         MODEL (
-          name analytics.fact_order_daily,
+          name analytics.{fact_model},
           kind INCREMENTAL_BY_TIME_RANGE (
             time_column ds
           ),
           partitioned_by [ds],
           dialect maxcompute,
-          start '2026-06-27',
+          start '2026-06-26',
           cron '@daily',
           physical_properties (lifecycle = 1)
         );
 
-        SELECT 1 AS order_id, CAST('2026-06-27' AS STRING) AS ds;
+        SELECT 1 AS order_id, CAST('2026-06-26' AS STRING) AS ds;
         """,
         encoding="utf-8",
     )
 
     config = Config(
         model_defaults=ModelDefaultsConfig(dialect="maxcompute"),
+        physical_schema_mapping={re.compile("^analytics$"): project},
         gateways={
             "maxcompute": GatewayConfig(
                 connection=MaxComputeConnectionConfig(
-                    project=os.environ["MAXCOMPUTE_PROJECT"],
+                    project=project,
                     schema=os.getenv("MAXCOMPUTE_SCHEMA"),
                     endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
                     access_key_id=os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
@@ -1382,23 +1410,28 @@ def test_maxcompute_smoke_plan_apply(tmp_path) -> None:
                     quota_name=os.getenv("MAXCOMPUTE_QUOTA_NAME"),
                     sql_hints={"odps.sql.allow.fullscan": "true"},
                 ),
-                state_connection=PostgresConnectionConfig(
-                    host=os.environ["SQLMESH_STATE_HOST"],
-                    port=int(os.getenv("SQLMESH_STATE_PORT", "5432")),
-                    user=os.environ["SQLMESH_STATE_USER"],
-                    password=os.environ["SQLMESH_STATE_PASSWORD"],
-                    database=os.environ["SQLMESH_STATE_DATABASE"],
-                ),
+                state_connection=DuckDBConnectionConfig(database=str(tmp_path / "state.duckdb")),
             )
         },
         default_gateway="maxcompute",
     )
 
     context = Context(paths=tmp_path, config=config)
+    adapter = context.engine_adapter
+    if adapter.odps.is_schema_namespace_enabled():
+        pytest.skip("This smoke test validates MaxCompute projects without schema namespace")
+
     plan = context.plan(no_prompts=True, auto_apply=False)
     assert plan.context_diff.has_changes
     context.apply(plan)
     context.apply(context.plan(no_prompts=True, auto_apply=False))
+
+    assert adapter.fetchall(
+        f"SELECT customer_id, customer_name FROM analytics__{dim_model} ORDER BY customer_id"
+    ) == [[1, "alice"]]
+    assert adapter.fetchall(
+        f"SELECT order_id, ds FROM analytics__{fact_model} ORDER BY order_id"
+    ) == [[1, "2026-06-26"]]
 ```
 
 The `maxcompute` optional dependency and pytest marker already exist in `pyproject.toml`; do not edit that file for this task unless the implementation has removed them.
@@ -1567,7 +1600,7 @@ Expected: PASS and `rg` prints all four required topics.
 - `VIEW`, `FULL`, and partition-aligned `INCREMENTAL_BY_TIME_RANGE` paths have unit coverage.
 - Gated real MaxCompute smoke test skips cleanly without credentials and passes with credentials.
 - User documentation explains scope, configuration, state connection separation, and non-transactional semantics.
-- Shared evaluator changes pass `tests/core/snapshot/test_evaluator.py` and `tests/core/engine_adapter/` regression checks.
+- Shared evaluator changes pass `tests/core/test_snapshot_evaluator.py` and `tests/core/engine_adapter/` regression checks.
 - After the implementing AI completes all tasks, it must summarize changes and wait for Claude code review before further iteration.
 
 ## Validation Command Package
@@ -1593,7 +1626,7 @@ pytest tests/core/engine_adapter/test_maxcompute.py tests/core/test_connection_c
 Run shared evaluator and adapter regression checks because Task 6 changes `IncrementalByTimeRangeStrategy` for every engine:
 
 ```bash
-pytest tests/core/snapshot/test_evaluator.py tests/core/engine_adapter/ -v
+pytest tests/core/test_snapshot_evaluator.py tests/core/engine_adapter/ -v
 ```
 
 Run style before handoff:
@@ -1601,6 +1634,28 @@ Run style before handoff:
 ```bash
 make style
 ```
+
+Latest focused verification package used during implementation:
+
+```bash
+.venv312/bin/python -m pytest tests/core/engine_adapter/test_maxcompute.py -q
+.venv312/bin/python -m pytest tests/core/test_snapshot_evaluator.py -q -k 'not materialized_view_with_partitioned_by_cluster_by'
+.venv312/bin/python -m pytest tests/core/engine_adapter/test_base.py -q
+ruff check sqlmesh/core/engine_adapter/maxcompute.py sqlmesh/core/config/connection.py sqlmesh/core/snapshot/evaluator.py tests/core/engine_adapter/test_maxcompute.py tests/core/engine_adapter/integration/test_integration_maxcompute.py tests/core/test_connection_config.py tests/core/test_dialect.py
+ruff format --check sqlmesh/core/engine_adapter/maxcompute.py sqlmesh/core/config/connection.py sqlmesh/core/snapshot/evaluator.py tests/core/engine_adapter/test_maxcompute.py tests/core/engine_adapter/integration/test_integration_maxcompute.py tests/core/test_connection_config.py tests/core/test_dialect.py
+```
+
+Real MaxCompute verification used during implementation:
+
+```bash
+MAXCOMPUTE_PROJECT=... \
+MAXCOMPUTE_ENDPOINT=... \
+MAXCOMPUTE_ACCESS_KEY_ID=... \
+MAXCOMPUTE_ACCESS_KEY_SECRET=... \
+.venv312/bin/python -m pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py -v
+```
+
+The real smoke validates a no-schema MaxCompute project, skips schema namespace enabled projects, runs `Context.plan(no_prompts=True)`, applies once, applies a second plan for idempotency, and reads back the folded objects named `analytics__<model>`.
 
 ## Execution Recommendation Order
 
@@ -1620,3 +1675,10 @@ make style
 1. **SQLGlot dialect alias limitations:** `maxcompute` is backed by Hive syntax, so any MaxCompute-specific DDL/DML must be rendered explicitly by the adapter instead of relying on generic AST serialization.
 2. **Dynamic partition projection order and expression preservation:** The adapter must never rely on source query order or dictionary insertion order for partition overwrite, and it must move existing projection expressions instead of rebuilding bare column references. Tests must assert exact SQL projection order and include computed aliases.
 3. **PyODPS runtime semantics:** DBAPI execution, schema namespace behavior, view replacement, and not-found exceptions can vary by MaxCompute project configuration. Re-check `ODPS.__init__` kwargs during Task 2, keep the unit implementation narrow, and use the gated smoke test to validate real behavior.
+
+## Remaining Follow-Ups
+
+1. Add a real smoke test for schema namespace enabled MaxCompute projects.
+2. Validate `CREATE OR REPLACE VIEW` across more MaxCompute project configurations; add drop/create fallback only if a real target requires it.
+3. Expand real schema/type fixtures for nested `struct`, `array`, and `map` edge cases.
+4. Design MCQA/MaxQA execution separately from the current PyODPS offline DBAPI path.
