@@ -70,6 +70,7 @@ from sqlmesh.core.snapshot.evaluator import (
     SCDType2Strategy,
     SnapshotCreationFailedError,
     ViewStrategy,
+    _adjust_physical_properties_for_engine,
 )
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 from sqlmesh.utils.date import to_timestamp
@@ -109,6 +110,42 @@ def date_kwargs() -> t.Dict[str, str]:
         "end": "2020-01-01",
         "execution_time": "2020-01-01",
     }
+
+
+def test_adjust_physical_properties_for_engine_passes_model_kind(adapter_mock) -> None:
+    model = SqlModel(
+        name="db.model",
+        kind=IncrementalByPartitionKind(),
+        query=parse_one("SELECT 1 AS a, CURRENT_DATE AS ds"),
+        partitioned_by=[exp.column("ds")],
+    )
+
+    physical_properties = {"partition_type": exp.Literal.string("LIST")}
+    assert _adjust_physical_properties_for_engine(adapter_mock, model, physical_properties) == (
+        physical_properties
+    )
+    adapter_mock.adjust_physical_properties_for_incremental.assert_called_once_with(
+        physical_properties,
+        model_kind=model.kind,
+        partitioned_by=model.partitioned_by,
+        requires_delete_capable_table=True,
+        unique_key=None,
+        model_name=model.name,
+    )
+
+
+def test_adjust_physical_properties_rejects_unpartitioned_unmanaged_overwrite(
+    adapter_mock,
+) -> None:
+    model = SqlModel(
+        name="db.model",
+        kind=IncrementalUnmanagedKind(insert_overwrite=True),
+        query=parse_one("SELECT 1 AS id"),
+    )
+    adapter_mock.SUPPORTS_UNPARTITIONED_INSERT_OVERWRITE = False
+
+    with pytest.raises(SQLMeshError, match="does not support unpartitioned"):
+        _adjust_physical_properties_for_engine(adapter_mock, model, {})
 
 
 @pytest.fixture
@@ -894,6 +931,37 @@ def test_evaluate_incremental_unmanaged_with_intervals(
             target_columns_to_types=model.columns_to_types,
             source_columns=None,
         )
+
+
+def test_evaluate_incremental_unmanaged_overwrite_without_partitions(
+    make_snapshot, adapter_mock
+) -> None:
+    model = SqlModel(
+        name="test_schema.test_model",
+        query=parse_one("SELECT 1 AS one"),
+        kind=IncrementalUnmanagedKind(insert_overwrite=True),
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    snapshot.intervals = [(to_timestamp("2020-01-01"), to_timestamp("2020-01-02"))]
+    adapter_mock.SUPPORTS_UNPARTITIONED_INSERT_OVERWRITE = True
+    adapter_mock.columns.return_value = model.columns_to_types
+
+    SnapshotEvaluator(adapter_mock).evaluate(
+        snapshot,
+        start="2020-01-01",
+        end="2020-01-02",
+        execution_time="2020-01-02",
+        snapshots={},
+    )
+
+    adapter_mock.insert_overwrite_by_partition.assert_called_once_with(
+        snapshot.table_name(),
+        model.render_query(),
+        [],
+        target_columns_to_types=model.columns_to_types,
+        source_columns=None,
+    )
 
 
 @pytest.mark.parametrize("insert_overwrite", [False, True])

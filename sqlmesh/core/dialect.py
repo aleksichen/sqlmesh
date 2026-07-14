@@ -121,7 +121,12 @@ class StagedFilePath(exp.Expression):
 
 
 class MaxCompute(Hive):
-    pass
+    class Generator(Hive.Generator):
+        TYPE_MAPPING = {
+            **Hive.Generator.TYPE_MAPPING,
+            exp.DataType.Type.DATETIME: "DATETIME",
+            exp.DataType.Type.TIMESTAMPNTZ: "TIMESTAMP_NTZ",
+        }
 
 
 def _parse_statement(self: Parser) -> t.Optional[exp.Expr]:

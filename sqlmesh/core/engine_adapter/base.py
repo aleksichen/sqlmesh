@@ -38,7 +38,7 @@ from sqlmesh.core.engine_adapter.shared import (
     SourceQuery,
     set_catalog,
 )
-from sqlmesh.core.model.kind import TimeColumn
+from sqlmesh.core.model.kind import ModelKind, TimeColumn
 from sqlmesh.core.schema_diff import SchemaDiffer, TableAlterOperation
 from sqlmesh.core.snapshot.execution_tracker import QueryExecutionTracker
 from sqlmesh.utils import (
@@ -116,6 +116,7 @@ class EngineAdapter:
     HAS_VIEW_BINDING = False
     RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = True
     SUPPORTS_REPLACE_TABLE = True
+    SUPPORTS_UNPARTITIONED_INSERT_OVERWRITE = False
     SUPPORTS_GRANTS = False
     DEFAULT_CATALOG_TYPE = DIALECT
     QUOTE_IDENTIFIERS_IN_VIEWS = True
@@ -2762,6 +2763,8 @@ class EngineAdapter:
         self,
         physical_properties: t.Dict[str, t.Any],
         *,
+        model_kind: ModelKind,
+        partitioned_by: t.List[exp.Expr],
         requires_delete_capable_table: bool,
         unique_key: t.Optional[t.List[exp.Expr]],
         model_name: str,
@@ -2775,6 +2778,9 @@ class EngineAdapter:
 
         Args:
             physical_properties: The model's physical properties.
+            model_kind: The incremental model kind, allowing adapters to distinguish execution
+                strategies such as unique-key merges, SCD Type 2 updates, and partition overwrites.
+            partitioned_by: The model's physical partition expressions.
             requires_delete_capable_table: Whether the model kind issues DELETE/MERGE statements
                 (as opposed to append-only INSERTs), as determined by the generic evaluator.
             unique_key: The model's unique key, populated only when the kind allows promoting it to

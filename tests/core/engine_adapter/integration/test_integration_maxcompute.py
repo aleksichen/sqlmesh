@@ -12,6 +12,7 @@ from sqlmesh.core.config import Config, GatewayConfig, ModelDefaultsConfig
 from sqlmesh.core.config.categorizer import CategorizerConfig
 from sqlmesh.core.config.connection import DuckDBConnectionConfig, MaxComputeConnectionConfig
 from sqlmesh.core.context import Context
+from sqlmesh.core.engine_adapter.shared import SourceQuery
 from sqlmesh.utils.date import to_timestamp
 
 pytestmark = pytest.mark.maxcompute
@@ -35,12 +36,124 @@ def _schema_smoke_requested() -> bool:
     return os.getenv("MAXCOMPUTE_SCHEMA_SMOKE", "").lower() in {"1", "true", "yes"}
 
 
+def _no_schema_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_NO_SCHEMA_SMOKE", "").lower() in {"1", "true", "yes"}
+
+
 def _lifecycle_smoke_requested() -> bool:
     return os.getenv("MAXCOMPUTE_LIFECYCLE_SMOKE", "").lower() in {"1", "true", "yes"}
 
 
+def _audit_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_AUDIT_SMOKE", "").lower() in {"1", "true", "yes"}
+
+
+def _capability_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_CAPABILITY_SMOKE", "").lower() in {"1", "true", "yes"}
+
+
+def _schema_evolution_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_SCHEMA_EVOLUTION_SMOKE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _transactional_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_TRANSACTIONAL_SMOKE", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _maxqa_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_MAXQA_SMOKE", "").lower() in {"1", "true", "yes"}
+
+
+def _model_kind_smoke_requested() -> bool:
+    return os.getenv("MAXCOMPUTE_MODEL_KIND_SMOKE", "").lower() in {"1", "true", "yes"}
+
+
 def _is_two_tier_project_error(error: Exception) -> bool:
     return _TWO_TIER_PROJECT_ERROR in str(error).casefold()
+
+
+def _cleanup_prefixed_objects(odps, project: str, schema: str, prefixes: tuple[str, ...]) -> None:
+    from odps.errors import NoSuchObject
+
+    cleanup_prefixes = prefixes + tuple(f"__temp_{prefix}" for prefix in prefixes)
+    deadline = time.monotonic() + 30
+    consecutive_empty_lists = 0
+    while time.monotonic() < deadline:
+        matching_objects = [
+            table
+            for table in odps.list_tables(project=project, schema=schema)
+            if table.name.startswith(cleanup_prefixes)
+        ]
+        if not matching_objects:
+            consecutive_empty_lists += 1
+            if consecutive_empty_lists == 3:
+                return
+            time.sleep(1)
+            continue
+
+        consecutive_empty_lists = 0
+        for table in matching_objects:
+            try:
+                if getattr(table, "is_materialized_view", False):
+                    odps.delete_materialized_view(
+                        table.name, project=project, schema=schema, if_exists=True
+                    )
+                elif getattr(table, "is_virtual_view", False):
+                    odps.delete_view(table.name, project=project, schema=schema, if_exists=True)
+                else:
+                    odps.delete_table(table.name, project=project, schema=schema, if_exists=True)
+            except NoSuchObject:
+                continue
+        time.sleep(1)
+
+    remaining = [
+        table.name
+        for table in odps.list_tables(project=project, schema=schema)
+        if table.name.startswith(prefixes)
+    ]
+    raise AssertionError(f"Timed out cleaning MaxCompute test objects: {remaining}")
+
+
+@pytest.mark.skipif(
+    not _has_maxcompute_env() or not _maxqa_smoke_requested(),
+    reason="MaxCompute MaxQA smoke test is not explicitly enabled",
+)
+def test_maxcompute_maxqa_query() -> None:
+    project = os.environ["MAXCOMPUTE_PROJECT"]
+    schema = os.getenv("MAXCOMPUTE_SCHEMA", "")
+    quota_name = os.getenv("MAXCOMPUTE_QUOTA_NAME")
+    if project != "york_fic" or schema != "sqlmesh":
+        pytest.fail("The MaxQA smoke test is restricted to york_fic.sqlmesh")
+    if not quota_name:
+        pytest.fail("MAXCOMPUTE_QUOTA_NAME is required for the MaxQA smoke test")
+
+    connection = MaxComputeConnectionConfig(
+        project=project,
+        schema=schema,
+        endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+        access_key_id=os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+        access_key_secret=os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+        quota_name=quota_name,
+        execution_mode="maxqa",
+        maxqa_fallback_policy="none",
+        sql_hints={
+            "odps.namespace.schema": "true",
+            "odps.sql.allow.namespace.schema": "true",
+        },
+    )
+    adapter = connection.create_engine_adapter()
+    try:
+        assert adapter.fetchone("SELECT 1") == [1]
+    finally:
+        adapter.close()
 
 
 @pytest.mark.parametrize(
@@ -57,10 +170,883 @@ def test_is_two_tier_project_error(error: Exception, expected: bool) -> None:
 
 
 @pytest.mark.skipif(
-    not _has_maxcompute_env(), reason="MaxCompute smoke credentials are not configured"
+    not _has_maxcompute_env() or not _audit_smoke_requested(),
+    reason="MaxCompute audit smoke test is not explicitly enabled",
+)
+def test_maxcompute_real_audit_execution(tmp_path) -> None:
+    from odps import ODPS
+
+    project = os.environ["MAXCOMPUTE_PROJECT"]
+    schema = os.getenv("MAXCOMPUTE_SCHEMA", "")
+    if project != "york_fic":
+        pytest.fail("The audit smoke test is restricted to MAXCOMPUTE_PROJECT=york_fic")
+    if schema != "sqlmesh":
+        pytest.fail("The audit smoke test is restricted to MAXCOMPUTE_SCHEMA=sqlmesh")
+
+    test_id = uuid.uuid4().hex
+    model_prefix = f"sqlmesh_audit_{test_id}"
+    source_table = f"{model_prefix}_source"
+    audited_model = f"{model_prefix}_view"
+    namespace_hints = {
+        "odps.namespace.schema": "true",
+        "odps.sql.allow.namespace.schema": "true",
+        "odps.sql.allow.fullscan": "true",
+    }
+    bootstrap_odps = ODPS(
+        os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+        os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+        project=project,
+        endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+        schema=schema,
+    )
+
+    if not bootstrap_odps.exist_schema(schema, project=project):
+        pytest.fail(f"The pre-created MaxCompute schema {project}.{schema} does not exist")
+    initial_objects = {
+        table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+    }
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "audited_view.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{audited_model},
+          kind VIEW,
+          audits (not_null(columns := [payload])),
+          dialect maxcompute
+        );
+
+        SELECT id, payload
+        FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="maxcompute"),
+        physical_schema_mapping={re.compile(f"^{re.escape(schema)}$"): schema},
+        gateways={
+            "maxcompute": GatewayConfig(
+                connection=MaxComputeConnectionConfig(
+                    project=project,
+                    schema=schema,
+                    endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+                    access_key_id=os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+                    access_key_secret=os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+                    quota_name=os.getenv("MAXCOMPUTE_QUOTA_NAME"),
+                    sql_hints=namespace_hints,
+                ),
+                state_connection=DuckDBConnectionConfig(
+                    database=str(tmp_path / "state.duckdb"), concurrent_tasks=1
+                ),
+            )
+        },
+        default_gateway="maxcompute",
+    )
+
+    context = None
+    try:
+        context = Context(paths=tmp_path, config=config)
+        adapter = context.engine_adapter
+        assert adapter._is_schema_namespace_enabled()
+
+        source_name = exp.table_(source_table, db=schema)
+        source_columns = {
+            "id": exp.DataType.build("BIGINT"),
+            "payload": exp.DataType.build("STRING"),
+        }
+        adapter.create_table(
+            source_name,
+            source_columns,
+            table_properties={"lifecycle": exp.Literal.number(1)},
+        )
+        adapter.replace_query(
+            source_name,
+            parse_one("SELECT CAST(1 AS BIGINT) AS id, 'valid' AS payload", dialect="maxcompute"),
+            target_columns_to_types=source_columns,
+        )
+
+        plan = context.plan(no_prompts=True, auto_apply=False)
+        assert plan.context_diff.has_changes
+        context.apply(plan)
+
+        model_name = f"{schema}.{audited_model}"
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{audited_model}` ORDER BY id"
+        ) == [[1, "valid"]]
+        assert context.audit(
+            start="2026-07-14",
+            end="2026-07-14",
+            models=iter([model_name]),
+            execution_time="2026-07-14 01:00:00 UTC",
+        )
+
+        adapter.replace_query(
+            source_name,
+            parse_one(
+                "SELECT CAST(1 AS BIGINT) AS id, CAST(NULL AS STRING) AS payload",
+                dialect="maxcompute",
+            ),
+            target_columns_to_types=source_columns,
+        )
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{audited_model}` ORDER BY id"
+        ) == [[1, None]]
+        assert not context.audit(
+            start="2026-07-14",
+            end="2026-07-14",
+            models=iter([model_name]),
+            execution_time="2026-07-14 01:00:00 UTC",
+        )
+    finally:
+        if re.fullmatch(r"sqlmesh_audit_[0-9a-f]{32}", model_prefix) is None:
+            raise AssertionError(f"Unsafe audit test prefix: {model_prefix}")
+
+        _cleanup_prefixed_objects(
+            bootstrap_odps,
+            project,
+            schema,
+            (model_prefix, f"{schema}__{model_prefix}"),
+        )
+
+        assert bootstrap_odps.exist_schema(schema, project=project)
+        assert {
+            table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+        } == initial_objects
+
+
+@pytest.mark.skipif(
+    not _has_maxcompute_env() or not _capability_smoke_requested(),
+    reason="MaxCompute capability smoke test is not explicitly enabled",
+)
+def test_maxcompute_schema_adapter_capabilities(tmp_path) -> None:
+    from odps import ODPS
+
+    project = os.environ["MAXCOMPUTE_PROJECT"]
+    schema = os.getenv("MAXCOMPUTE_SCHEMA", "")
+    if project != "york_fic" or schema != "sqlmesh":
+        pytest.fail("The capability smoke test is restricted to york_fic.sqlmesh")
+
+    test_id = uuid.uuid4().hex
+    prefix = f"sqlmesh_capability_{test_id}"
+    base_table = f"{prefix}_base"
+    copy_table = f"{prefix}_copy"
+    renamed_table = f"{prefix}_renamed"
+    evolution_table = f"{prefix}_evolution"
+    transactional_table = f"{prefix}_transactional"
+    automatic_partition_table = f"{prefix}_auto_partition"
+    materialized_view = f"{prefix}_mv"
+    namespace_hints = {
+        "odps.namespace.schema": "true",
+        "odps.sql.allow.namespace.schema": "true",
+        "odps.sql.allow.fullscan": "true",
+    }
+    bootstrap_odps = ODPS(
+        os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+        os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+        project=project,
+        endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+        schema=schema,
+    )
+    if not bootstrap_odps.exist_schema(schema, project=project):
+        pytest.fail(f"The pre-created MaxCompute schema {project}.{schema} does not exist")
+    initial_objects = {
+        table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+    }
+    initial_schemas = {candidate.name for candidate in bootstrap_odps.list_schemas(project=project)}
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="maxcompute"),
+        physical_schema_mapping={re.compile(f"^{re.escape(schema)}$"): schema},
+        gateways={
+            "maxcompute": GatewayConfig(
+                connection=MaxComputeConnectionConfig(
+                    project=project,
+                    schema=schema,
+                    endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+                    access_key_id=os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+                    access_key_secret=os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+                    quota_name=os.getenv("MAXCOMPUTE_QUOTA_NAME"),
+                    sql_hints=namespace_hints,
+                    register_comments=True,
+                ),
+                state_connection=DuckDBConnectionConfig(
+                    database=str(tmp_path / "state.duckdb"), concurrent_tasks=1
+                ),
+            )
+        },
+        default_gateway="maxcompute",
+    )
+
+    context = Context(paths=tmp_path, config=config)
+    adapter = context.engine_adapter
+    base_columns = {
+        "id": exp.DataType.build("BIGINT"),
+        "payload": exp.DataType.build("STRING"),
+        "ds": exp.DataType.build("STRING"),
+    }
+
+    try:
+        adapter.create_table(
+            exp.table_(base_table, db=schema),
+            base_columns,
+            table_description="SQLMesh capability base table",
+            column_descriptions={"id": "Primary identifier", "payload": "Payload"},
+            partitioned_by=[exp.column("ds")],
+            table_properties={"lifecycle": exp.Literal.number(1)},
+        )
+        adapter.replace_query(
+            exp.table_(base_table, db=schema),
+            parse_one(
+                """
+                SELECT CAST(1 AS BIGINT) AS id, 'one' AS payload, '2026-07-14' AS ds
+                UNION ALL
+                SELECT CAST(2 AS BIGINT) AS id, 'two' AS payload, '2026-07-14' AS ds
+                """,
+                dialect="maxcompute",
+            ),
+            target_columns_to_types=base_columns,
+            partitioned_by=[exp.column("ds")],
+        )
+        base_metadata = bootstrap_odps.get_table(base_table, project=project, schema=schema)
+        assert base_metadata.comment == "SQLMesh capability base table"
+        assert base_metadata.table_schema["id"].comment == "Primary identifier"
+        assert adapter.fetchdf(
+            f"SELECT id, payload, ds FROM `{schema}`.`{base_table}` ORDER BY id"
+        ).to_dict("records") == [
+            {"id": 1, "payload": "one", "ds": "2026-07-14"},
+            {"id": 2, "payload": "two", "ds": "2026-07-14"},
+        ]
+
+        adapter.ctas(
+            exp.table_(copy_table, db=schema),
+            parse_one(
+                f"SELECT id, payload, ds FROM `{schema}`.`{base_table}`",
+                dialect="maxcompute",
+            ),
+            target_columns_to_types=base_columns,
+        )
+        table_diff = context.table_diff(
+            source=f"{schema}.{base_table}",
+            target=f"{schema}.{copy_table}",
+            on=["id"],
+            show=False,
+            temp_schema=schema,
+        )[0]
+        assert not table_diff.schema_diff().added
+        assert table_diff.row_diff(temp_schema=schema).full_match_count == 2
+
+        adapter.rename_table(
+            exp.table_(copy_table, db=schema), exp.table_(renamed_table, db=schema)
+        )
+        assert bootstrap_odps.exist_table(renamed_table, project=project, schema=schema)
+        adapter._truncate_table(exp.table_(renamed_table, db=schema))
+        assert adapter.fetchone(f"SELECT COUNT(*) FROM `{schema}`.`{renamed_table}`") == [0]
+
+        if _schema_evolution_smoke_requested():
+            adapter.create_table(
+                exp.table_(evolution_table, db=schema),
+                {"id": exp.DataType.build("INT")},
+                table_properties={"lifecycle": exp.Literal.number(1)},
+            )
+            adapter.alter_table(
+                [
+                    exp.Alter(
+                        this=exp.table_(evolution_table, db=schema),
+                        kind="TABLE",
+                        actions=[
+                            exp.ColumnDef(
+                                this=exp.to_identifier("amount"),
+                                kind=exp.DataType.build("DECIMAL(18, 2)"),
+                            )
+                        ],
+                    ),
+                    exp.Alter(
+                        this=exp.table_(evolution_table, db=schema),
+                        kind="TABLE",
+                        actions=[
+                            exp.AlterColumn(
+                                this=exp.to_identifier("id"),
+                                dtype=exp.DataType.build("BIGINT"),
+                            )
+                        ],
+                    ),
+                ]
+            )
+            assert adapter.columns(exp.table_(evolution_table, db=schema)) == {
+                "id": exp.DataType.build("BIGINT"),
+                "amount": exp.DataType.build("DECIMAL(18, 2)"),
+            }
+
+        transactional_columns = {
+            "id": exp.DataType.build("BIGINT"),
+            "payload": exp.DataType.build("STRING"),
+        }
+        adapter.create_table(
+            exp.table_(transactional_table, db=schema),
+            transactional_columns,
+            table_properties={
+                "transactional": exp.true(),
+                "primary_key": exp.column("id"),
+                "write_bucket_num": exp.Literal.number(16),
+                "lifecycle": exp.Literal.number(1),
+            },
+        )
+        adapter.insert_append(
+            exp.table_(transactional_table, db=schema),
+            parse_one("SELECT CAST(1 AS BIGINT) AS id, 'before' AS payload"),
+            target_columns_to_types=transactional_columns,
+        )
+        adapter.merge(
+            exp.table_(transactional_table, db=schema),
+            parse_one(
+                """
+                SELECT CAST(1 AS BIGINT) AS id, 'after' AS payload
+                UNION ALL SELECT CAST(2 AS BIGINT) AS id, 'new' AS payload
+                """
+            ),
+            transactional_columns,
+            unique_key=[exp.column("id")],
+        )
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{transactional_table}` ORDER BY id"
+        ) == [[1, "after"], [2, "new"]]
+        assert (
+            adapter.get_table_last_modified_ts([exp.table_(transactional_table, db=schema)])[0] > 0
+        )
+
+        automatic_columns = {
+            "event_id": exp.DataType.build("BIGINT"),
+            "event_ts": exp.DataType.build("TIMESTAMP"),
+        }
+        adapter.create_table(
+            exp.table_(automatic_partition_table, db=schema),
+            automatic_columns,
+            partitioned_by=[parse_one("TRUNC_TIME(event_ts, 'day') AS ds")],
+            table_properties={"lifecycle": exp.Literal.number(1)},
+        )
+        adapter.insert_append(
+            exp.table_(automatic_partition_table, db=schema),
+            parse_one(
+                "SELECT CAST(1 AS BIGINT) AS event_id, "
+                "CAST('2026-07-13 01:00:00' AS TIMESTAMP) AS event_ts "
+                "UNION ALL SELECT CAST(10 AS BIGINT) AS event_id, "
+                "CAST('2026-07-14 01:00:00' AS TIMESTAMP) AS event_ts"
+            ),
+            target_columns_to_types=automatic_columns,
+        )
+        auto_table = bootstrap_odps.get_table(
+            automatic_partition_table, project=project, schema=schema
+        )
+        assert auto_table.table_schema.partitions[0].generate_expression
+        assert adapter.fetchone(
+            f"SELECT COUNT(*) FROM `{schema}`.`{automatic_partition_table}`"
+        ) == [2]
+        adapter._insert_overwrite_by_time_partition(
+            exp.table_(automatic_partition_table, db=schema),
+            [
+                SourceQuery(
+                    query_factory=lambda: parse_one(
+                        "SELECT CAST(2 AS BIGINT) AS event_id, "
+                        "CAST('2026-07-14 02:00:00' AS TIMESTAMP) AS event_ts"
+                    )
+                )
+            ],
+            target_columns_to_types=automatic_columns,
+            where=parse_one(
+                "event_ts >= CAST('2026-07-14 00:00:00' AS TIMESTAMP) "
+                "AND event_ts < CAST('2026-07-15 00:00:00' AS TIMESTAMP)"
+            ),
+            partitioned_by=[parse_one("TRUNC_TIME(event_ts, 'day') AS ds")],
+        )
+        assert adapter.fetchall(
+            f"SELECT event_id FROM `{schema}`.`{automatic_partition_table}` ORDER BY event_id"
+        ) == [[1], [2]]
+
+        adapter.create_view(
+            exp.table_(materialized_view, db=schema),
+            parse_one(
+                f"SELECT id, payload, ds FROM `{schema}`.`{base_table}`",
+                dialect="maxcompute",
+            ),
+            target_columns_to_types=base_columns,
+            replace=False,
+            materialized=True,
+            table_description="SQLMesh capability materialized view",
+            materialized_properties={
+                "partitioned_by": [exp.column("ds")],
+                "clustered_by": [exp.column("id")],
+            },
+            view_properties={
+                "lifecycle": exp.Literal.number(1),
+                "cluster_bucket_num": exp.Literal.number(8),
+            },
+        )
+        mv_metadata = bootstrap_odps.get_table(materialized_view, project=project, schema=schema)
+        assert mv_metadata.is_materialized_view
+        assert adapter.fetchone(f"SELECT COUNT(*) FROM `{schema}`.`{materialized_view}`") == [2]
+    finally:
+        if re.fullmatch(r"sqlmesh_capability_[0-9a-f]{32}", prefix) is None:
+            raise AssertionError(f"Unsafe capability test prefix: {prefix}")
+        _cleanup_prefixed_objects(bootstrap_odps, project, schema, (prefix,))
+
+        assert bootstrap_odps.exist_schema(schema, project=project)
+        assert {
+            table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+        } == initial_objects
+        assert {
+            candidate.name for candidate in bootstrap_odps.list_schemas(project=project)
+        } == initial_schemas
+
+
+@pytest.mark.skipif(
+    not _has_maxcompute_env() or not _transactional_smoke_requested(),
+    reason="MaxCompute transactional model smoke test is not explicitly enabled",
+)
+def test_maxcompute_transactional_models_plan_apply(tmp_path) -> None:
+    from odps import ODPS
+
+    project = os.environ["MAXCOMPUTE_PROJECT"]
+    schema = os.getenv("MAXCOMPUTE_SCHEMA", "")
+    if project != "york_fic" or schema != "sqlmesh":
+        pytest.fail("The transactional smoke test is restricted to york_fic.sqlmesh")
+
+    test_id = uuid.uuid4().hex
+    prefix = f"sqlmesh_transactional_{test_id}"
+    source_table = f"{prefix}_source"
+    unique_model = f"{prefix}_unique"
+    scd_time_model = f"{prefix}_scd_time"
+    scd_column_model = f"{prefix}_scd_column"
+    namespace_hints = {
+        "odps.namespace.schema": "true",
+        "odps.sql.allow.namespace.schema": "true",
+        "odps.sql.allow.fullscan": "true",
+    }
+    bootstrap_odps = ODPS(
+        os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+        os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+        project=project,
+        endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+        schema=schema,
+    )
+    initial_objects = {
+        table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+    }
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "unique.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{unique_model},
+          kind INCREMENTAL_BY_UNIQUE_KEY (unique_key id),
+          columns (id BIGINT, payload STRING, updated_at TIMESTAMP),
+          start '2026-07-13',
+          cron '@daily',
+          dialect maxcompute,
+          physical_properties (
+            transactional = true,
+            primary_key = id,
+            write_bucket_num = 16,
+            lifecycle = 1
+          )
+        );
+
+        SELECT id, payload, updated_at FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "scd_time.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{scd_time_model},
+          kind SCD_TYPE_2_BY_TIME (
+            unique_key id,
+            updated_at_name updated_at,
+            invalidate_hard_deletes true
+          ),
+          columns (id BIGINT, payload STRING, updated_at TIMESTAMP),
+          start '2026-07-13',
+          cron '@daily',
+          dialect maxcompute,
+          physical_properties (transactional = true, lifecycle = 1)
+        );
+
+        SELECT id, payload, updated_at FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "scd_column.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{scd_column_model},
+          kind SCD_TYPE_2_BY_COLUMN (
+            unique_key id,
+            columns [payload],
+            invalidate_hard_deletes true
+          ),
+          columns (id BIGINT, payload STRING, updated_at TIMESTAMP),
+          start '2026-07-13',
+          cron '@daily',
+          dialect maxcompute,
+          physical_properties (transactional = true, lifecycle = 1)
+        );
+
+        SELECT id, payload, updated_at FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="maxcompute"),
+        physical_schema_mapping={re.compile(f"^{re.escape(schema)}$"): schema},
+        gateways={
+            "maxcompute": GatewayConfig(
+                connection=MaxComputeConnectionConfig(
+                    project=project,
+                    schema=schema,
+                    endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+                    access_key_id=os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+                    access_key_secret=os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+                    quota_name=os.getenv("MAXCOMPUTE_QUOTA_NAME"),
+                    sql_hints=namespace_hints,
+                ),
+                state_connection=DuckDBConnectionConfig(
+                    database=str(tmp_path / "state.duckdb"), concurrent_tasks=1
+                ),
+            )
+        },
+        default_gateway="maxcompute",
+    )
+    context = Context(paths=tmp_path, config=config)
+    adapter = context.engine_adapter
+    source_columns = {
+        "id": exp.DataType.build("BIGINT"),
+        "payload": exp.DataType.build("STRING"),
+        "updated_at": exp.DataType.build("TIMESTAMP"),
+    }
+
+    def replace_source(rows_sql: str) -> None:
+        adapter.replace_query(
+            exp.table_(source_table, db=schema),
+            parse_one(rows_sql, dialect="maxcompute"),
+            target_columns_to_types=source_columns,
+        )
+
+    try:
+        adapter.create_table(
+            exp.table_(source_table, db=schema),
+            source_columns,
+            table_properties={"lifecycle": exp.Literal.number(1)},
+        )
+        replace_source(
+            "SELECT CAST(1 AS BIGINT) AS id, 'one' AS payload, "
+            "CAST('2026-07-13 01:00:00' AS TIMESTAMP) AS updated_at"
+        )
+
+        plan = context.plan(
+            execution_time="2026-07-14 01:00:00 UTC",
+            no_prompts=True,
+            auto_apply=False,
+        )
+        context.apply(plan)
+        context.apply(
+            context.plan(
+                execution_time="2026-07-14 01:00:00 UTC",
+                no_prompts=True,
+                auto_apply=False,
+            )
+        )
+
+        replace_source(
+            """
+            SELECT CAST(1 AS BIGINT) AS id, 'one-updated' AS payload,
+                   CAST('2026-07-14 01:00:00' AS TIMESTAMP) AS updated_at
+            UNION ALL
+            SELECT CAST(2 AS BIGINT) AS id, 'two' AS payload,
+                   CAST('2026-07-14 01:00:00' AS TIMESTAMP) AS updated_at
+            """
+        )
+        assert context.run(end="2026-07-14", execution_time="2026-07-15 01:00:00 UTC").is_success
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{unique_model}` ORDER BY id"
+        ) == [[1, "one-updated"], [2, "two"]]
+        for model_name in (scd_time_model, scd_column_model):
+            assert adapter.fetchall(
+                f"SELECT id, payload FROM `{schema}`.`{model_name}` "
+                "WHERE valid_to IS NULL ORDER BY id"
+            ) == [[1, "one-updated"], [2, "two"]]
+
+        replace_source(
+            "SELECT CAST(2 AS BIGINT) AS id, 'two' AS payload, "
+            "CAST('2026-07-15 01:00:00' AS TIMESTAMP) AS updated_at"
+        )
+        assert context.run(end="2026-07-15", execution_time="2026-07-16 01:00:00 UTC").is_success
+        for model_name in (scd_time_model, scd_column_model):
+            assert adapter.fetchall(
+                f"SELECT id FROM `{schema}`.`{model_name}` WHERE valid_to IS NULL ORDER BY id"
+            ) == [[2]]
+
+        for model_name in (unique_model, scd_time_model, scd_column_model):
+            snapshot = context.get_snapshot(f"{schema}.{model_name}", raise_if_missing=True)
+            physical_table = exp.to_table(snapshot.table_name()).name
+            metadata = bootstrap_odps.get_table(physical_table, project=project, schema=schema)
+            assert metadata.is_transactional
+            assert metadata.lifecycle == 1
+    finally:
+        if re.fullmatch(r"sqlmesh_transactional_[0-9a-f]{32}", prefix) is None:
+            raise AssertionError(f"Unsafe transactional test prefix: {prefix}")
+        _cleanup_prefixed_objects(bootstrap_odps, project, schema, (prefix, f"{schema}__{prefix}"))
+        assert {
+            table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+        } == initial_objects
+
+
+@pytest.mark.skipif(
+    not _has_maxcompute_env() or not _model_kind_smoke_requested(),
+    reason="MaxCompute model kind smoke test is not explicitly enabled",
+)
+def test_maxcompute_additional_model_kinds_plan_apply(tmp_path) -> None:
+    from odps import ODPS
+
+    project = os.environ["MAXCOMPUTE_PROJECT"]
+    schema = os.getenv("MAXCOMPUTE_SCHEMA", "")
+    if project != "york_fic" or schema != "sqlmesh":
+        pytest.fail("The model kind smoke test is restricted to york_fic.sqlmesh")
+
+    test_id = uuid.uuid4().hex
+    prefix = f"sqlmesh_model_kind_{test_id}"
+    source_table = f"{prefix}_source"
+    external_table = f"{prefix}_external"
+    partition_model = f"{prefix}_partition"
+    unmanaged_model = f"{prefix}_unmanaged"
+    embedded_model = f"{prefix}_embedded"
+    embedded_consumer = f"{prefix}_embedded_consumer"
+    materialized_view_model = f"{prefix}_mv"
+    namespace_hints = {
+        "odps.namespace.schema": "true",
+        "odps.sql.allow.namespace.schema": "true",
+        "odps.sql.allow.fullscan": "true",
+    }
+    bootstrap_odps = ODPS(
+        os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+        os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+        project=project,
+        endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+        schema=schema,
+    )
+    initial_objects = {
+        table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+    }
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+    (models_dir / "partition.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{partition_model},
+          kind INCREMENTAL_BY_PARTITION,
+          columns (id BIGINT, payload STRING, ds STRING),
+          partitioned_by [ds],
+          start '2026-07-13',
+          cron '@daily',
+          dialect maxcompute,
+          physical_properties (lifecycle = 1)
+        );
+
+        SELECT id, payload, ds FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "unmanaged.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{unmanaged_model},
+          kind INCREMENTAL_UNMANAGED (insert_overwrite true),
+          columns (id BIGINT, payload STRING),
+          start '2026-07-13',
+          cron '@daily',
+          dialect maxcompute,
+          physical_properties (lifecycle = 1)
+        );
+
+        SELECT id, payload FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "external.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{external_table},
+          kind EXTERNAL,
+          columns (id BIGINT, payload STRING),
+          dialect maxcompute
+        );
+
+        SELECT 1;
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "embedded.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{embedded_model},
+          kind EMBEDDED,
+          columns (id BIGINT, payload STRING),
+          dialect maxcompute
+        );
+
+        SELECT id, payload FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "embedded_consumer.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{embedded_consumer},
+          kind FULL,
+          columns (id BIGINT, payload STRING),
+          dialect maxcompute,
+          physical_properties (lifecycle = 1)
+        );
+
+        SELECT id, payload FROM {schema}.{embedded_model};
+        """,
+        encoding="utf-8",
+    )
+    (models_dir / "materialized_view.sql").write_text(
+        f"""
+        MODEL (
+          name {schema}.{materialized_view_model},
+          kind VIEW (materialized true),
+          columns (id BIGINT, payload STRING, ds STRING),
+          partitioned_by [ds],
+          clustered_by [id],
+          dialect maxcompute,
+          physical_properties (lifecycle = 1, cluster_bucket_num = 8)
+        );
+
+        SELECT id, payload, ds FROM {schema}.{source_table};
+        """,
+        encoding="utf-8",
+    )
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="maxcompute"),
+        physical_schema_mapping={re.compile(f"^{re.escape(schema)}$"): schema},
+        gateways={
+            "maxcompute": GatewayConfig(
+                connection=MaxComputeConnectionConfig(
+                    project=project,
+                    schema=schema,
+                    endpoint=os.environ["MAXCOMPUTE_ENDPOINT"],
+                    access_key_id=os.environ["MAXCOMPUTE_ACCESS_KEY_ID"],
+                    access_key_secret=os.environ["MAXCOMPUTE_ACCESS_KEY_SECRET"],
+                    sql_hints=namespace_hints,
+                ),
+                state_connection=DuckDBConnectionConfig(
+                    database=str(tmp_path / "state.duckdb"), concurrent_tasks=1
+                ),
+            )
+        },
+        default_gateway="maxcompute",
+    )
+    context = Context(paths=tmp_path, config=config)
+    adapter = context.engine_adapter
+    source_columns = {
+        "id": exp.DataType.build("BIGINT"),
+        "payload": exp.DataType.build("STRING"),
+        "ds": exp.DataType.build("STRING"),
+    }
+
+    try:
+        adapter.create_table(
+            exp.table_(source_table, db=schema),
+            source_columns,
+            partitioned_by=[exp.column("ds")],
+            table_properties={"lifecycle": exp.Literal.number(1)},
+        )
+        adapter.insert_append(
+            exp.table_(source_table, db=schema),
+            parse_one("SELECT CAST(1 AS BIGINT) AS id, 'one' AS payload, '2026-07-13' AS ds"),
+            target_columns_to_types=source_columns,
+        )
+        adapter.create_table(
+            exp.table_(external_table, db=schema),
+            {"id": exp.DataType.build("BIGINT"), "payload": exp.DataType.build("STRING")},
+            table_properties={"lifecycle": exp.Literal.number(1)},
+        )
+        adapter.insert_append(
+            exp.table_(external_table, db=schema),
+            parse_one("SELECT CAST(9 AS BIGINT) AS id, 'external' AS payload"),
+            target_columns_to_types={
+                "id": exp.DataType.build("BIGINT"),
+                "payload": exp.DataType.build("STRING"),
+            },
+        )
+
+        context.apply(
+            context.plan(
+                execution_time="2026-07-14 01:00:00 UTC",
+                no_prompts=True,
+                auto_apply=False,
+            )
+        )
+        context.apply(
+            context.plan(
+                execution_time="2026-07-14 01:00:00 UTC",
+                no_prompts=True,
+                auto_apply=False,
+            )
+        )
+
+        assert adapter.fetchall(
+            f"SELECT id, payload, ds FROM `{schema}`.`{partition_model}` ORDER BY id"
+        ) == [[1, "one", "2026-07-13"]]
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{unmanaged_model}` ORDER BY id"
+        ) == [[1, "one"]]
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{embedded_consumer}` ORDER BY id"
+        ) == [[1, "one"]]
+        assert adapter.fetchall(
+            f"SELECT id, payload FROM `{schema}`.`{external_table}` ORDER BY id"
+        ) == [[9, "external"]]
+        assert not bootstrap_odps.exist_table(embedded_model, project=project, schema=schema)
+        logical_mv_metadata = bootstrap_odps.get_table(
+            materialized_view_model, project=project, schema=schema
+        )
+        assert logical_mv_metadata.is_virtual_view
+        mv_snapshot = context.get_snapshot(
+            f"{schema}.{materialized_view_model}", raise_if_missing=True
+        )
+        physical_mv_name = exp.to_table(mv_snapshot.table_name()).name
+        assert bootstrap_odps.get_table(
+            physical_mv_name, project=project, schema=schema
+        ).is_materialized_view
+        assert adapter.fetchall(
+            f"SELECT id, payload, ds FROM `{schema}`.`{materialized_view_model}` ORDER BY id"
+        ) == [[1, "one", "2026-07-13"]]
+    finally:
+        if re.fullmatch(r"sqlmesh_model_kind_[0-9a-f]{32}", prefix) is None:
+            raise AssertionError(f"Unsafe model kind test prefix: {prefix}")
+        _cleanup_prefixed_objects(bootstrap_odps, project, schema, (prefix, f"{schema}__{prefix}"))
+        assert {
+            table.name for table in bootstrap_odps.list_tables(project=project, schema=schema)
+        } == initial_objects
+
+
+@pytest.mark.skipif(
+    not _has_maxcompute_env() or not _no_schema_smoke_requested(),
+    reason="MaxCompute no-schema smoke test is not explicitly enabled",
 )
 def test_maxcompute_no_schema_smoke_plan_apply(tmp_path) -> None:
     project = os.environ["MAXCOMPUTE_PROJECT"]
+    if project != "york_data" or os.getenv("MAXCOMPUTE_SCHEMA"):
+        pytest.fail(
+            "The no-schema smoke test is restricted to york_data with MAXCOMPUTE_SCHEMA unset"
+        )
     model_prefix = f"sqlmesh_smoke_{uuid.uuid4().hex[:8]}"
     dim_model = f"{model_prefix}_dim_customer"
     fact_model = f"{model_prefix}_fact_order_daily"
@@ -451,11 +1437,15 @@ def test_maxcompute_schema_lifecycle_restate_janitor(tmp_path, monkeypatch) -> N
         )
         assert bootstrap_odps.get_table(source_table, project=project, schema=schema).lifecycle == 1
 
-        initial_plan = context.plan(
-            execution_time="2026-07-14 01:00:00 UTC",
-            no_prompts=True,
-            auto_apply=False,
-        )
+        with patch(
+            "sqlmesh.core.snapshot.definition.now_timestamp",
+            return_value=to_timestamp("2026-07-14 01:00:00 UTC"),
+        ):
+            initial_plan = context.plan(
+                execution_time="2026-07-14 01:00:00 UTC",
+                no_prompts=True,
+                auto_apply=False,
+            )
         assert initial_plan.context_diff.has_changes
         context.apply(initial_plan)
 
@@ -704,17 +1694,12 @@ def test_maxcompute_schema_lifecycle_restate_janitor(tmp_path, monkeypatch) -> N
                     )
             bootstrap_odps.delete_schema(dev_schema, project=project)
 
-        current_base_objects = {
-            table.name: table
-            for table in bootstrap_odps.list_tables(project=project, schema=schema)
-        }
-        for name, table in current_base_objects.items():
-            if name in initial_base_objects or not lifecycle_object_name(name):
-                continue
-            if getattr(table, "is_virtual_view", False):
-                bootstrap_odps.delete_view(name, project=project, schema=schema, if_exists=True)
-            else:
-                bootstrap_odps.delete_table(name, project=project, schema=schema, if_exists=True)
+        _cleanup_prefixed_objects(
+            bootstrap_odps,
+            project,
+            schema,
+            (model_prefix, f"{schema}__{model_prefix}"),
+        )
 
         assert bootstrap_odps.exist_schema(schema, project=project)
         assert not dev_schema_exists()

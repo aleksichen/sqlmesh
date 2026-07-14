@@ -4,26 +4,39 @@
 
 ## Current Implementation Status（2026-07-14）
 
-This plan has been implemented on the current branch. The original TDD task breakdown is kept below for traceability; this status section records the effective behavior of the latest code.
+This plan has been implemented and subsequently extended on the current branch. The original TDD tasks remain below as historical traceability; they describe the minimum adapter, not the final capability boundary.
 
-- Implemented `MaxComputeEngineAdapter`, `MaxComputeConnectionConfig`, adapter registration, local `maxcompute` dialect alias, optional `pyodps` dependency, pytest marker, and user docs.
-- Implemented DDL/DML paths for `CREATE/DROP SCHEMA`, `CREATE/DROP TABLE`, `CREATE OR REPLACE VIEW`, `CTAS`, `INSERT INTO`, unpartitioned `INSERT OVERWRITE TABLE`, and partitioned `INSERT OVERWRITE TABLE ... PARTITION (...)`.
-- Implemented MaxCompute no-schema namespace handling: `CREATE/DROP SCHEMA` no-op, logical schema folded into object names as `schema__table`, physical table names folded the same way, and PyODPS metadata calls use `project=...` with `schema=None`.
-- Implemented effective schema namespace detection: an explicit connection `schema` enables schema-qualified behavior even when PyODPS tenant detection returns false.
-- Implemented PyODPS metadata paths for `columns`, `table_exists`, and `_get_data_objects`; no `DESCRIBE` text parsing is used.
-- Implemented `lifecycle` extraction from table properties and rendering as `LIFECYCLE n`.
-- Implemented projection reordering by moving existing select expressions, preserving computed aliases such as `price * quantity AS amount`.
-- Implemented non-partitioned FULL overwrite without a MaxCompute overwrite column list, matching positional overwrite semantics.
-- Implemented `where` handling through SQLMesh projection/filter wrapping so alias filters are applied outside the projected subquery.
-- Implemented a gated real MaxCompute no-schema `Context.plan()` + repeated `Context.apply()` smoke test using DuckDB state.
-- Implemented and passed a real `york_fic` schema-enabled `Context.plan()` + repeated `Context.apply()` smoke. It requires `MAXCOMPUTE_SCHEMA_SMOKE` opt-in, uses a random isolated `sqlmesh_smoke_<random>` schema, and never touches the default namespace.
+Current implementation truth:
 
-Known boundaries in the latest code:
+- Namespace behavior is centralized: schema-enabled projects preserve `project.schema.object`; no-schema projects skip schema DDL and fold names as `schema__table`. Real no-schema coverage is explicitly gated and restricted to `york_data`; protected schema tests use the pre-created `york_fic.sqlmesh` namespace.
+- Real plan/apply evidence covers `VIEW`, `FULL`, `INCREMENTAL_BY_TIME_RANGE`, `INCREMENTAL_BY_PARTITION`, unpartitioned `INCREMENTAL_UNMANAGED (insert_overwrite true)`, `INCREMENTAL_BY_UNIQUE_KEY`, both SCD2 kinds, `EXTERNAL`, and `EMBEDDED`.
+- UNIQUE_KEY and SCD2 require `physical_properties (transactional = true)`. Optional simple `primary_key` must equal the unique key; `write_bucket_num` is supported. SCD2 currently rejects `partitioned_by`.
+- Manual partitions render a `PARTITION (...)` clause and move existing partition projections to the end. Automatic partitions require explicit `TRUNC_TIME(ts, 'day|hour|month|year') AS alias`; the source must be `DATE`, `DATETIME`, `TIMESTAMP`, or `TIMESTAMP_NTZ`, validated before DDL with Unit coverage for accepted and rejected types. The dialect preserves native `DATETIME` and `TIMESTAMP_NTZ` instead of Hive's `TIMESTAMP` coercion, and the implicit `partition_interval` guard requires explicit `TRUNC_TIME` for all four supported temporal types (Unit). Append omits the DML partition clause. Automatic time-range overwrite requires a bounded condition, validates the target's actual PyODPS generated expression and alias, and uses a `LIFECYCLE 1` temporary full replacement to preserve rows outside the interval. It fails for an unpartitioned target or mismatched source/alias/granularity. A two-day `york_fic` smoke passed again with actual metadata and preserved the unaffected day. `INCREMENTAL_BY_PARTITION` remains limited to simple manual columns, and `DATE(ds)` is not implicitly reinterpreted.
+- HASH `clustered_by` requires `cluster_bucket_num`. Transactional and clustered table properties are rejected as an unsupported combination.
+- Materialized views support lifecycle, source partition, HASH cluster, comments, metadata, query, and drop/create replacement. Evaluator plan/apply is real verified; janitor object-type routing is unit tested. Regular `VIEW` rejects materialized/storage properties (Unit), and the adapter does not claim `CREATE OR REPLACE MATERIALIZED VIEW`.
+- Table/non-partition column comments, Pandas query reads, RowDiff/TableDiff, metadata type/last-modified fields, schema-enabled same-namespace rename, and non-partition truncate have Real evidence. Manual partition column comments render during creation (Unit). No-schema rename requires the same logical namespace before name folding (Unit). Schema evolution has Unit coverage but is conditional because the `york_fic` project has schema-evolution DDL disabled.
+- Audit and the restatement/cron/run/janitor lifecycle have passed against `york_fic.sqlmesh` with DuckDB file state. The lifecycle test freezes snapshot creation time for deterministic expiry. PostgreSQL state was intentionally not tested.
+- MaxQA supports `execution_mode: offline | maxqa`, requires `quota_name`, maps to `use_sqa="v2"`, and supports fallback `none | default | all`. It has Unit coverage and a gated read-only test, but no real quota was available.
 
-- `execution_mode` is currently `Literal["offline"]`; `maxqa` / MCQA is intentionally rejected.
-- `partitioned_by` only accepts simple column references; transform partitions such as `DATE(ds)` are rejected.
-- MaxCompute state sync, Python models, pandas DataFrame writes, materialized views, SCD Type 2, grants, and atomic full table replacement remain out of scope.
-- Real integration smoke coverage includes both no-schema and schema-enabled behavior. Schema-enabled coverage is deliberately opt-in because it creates and drops an isolated schema.
+Current boundaries:
+
+- `SUPPORTS_TRANSACTIONS=False` means no DBAPI multi-statement transaction contract; transactional MaxCompute tables remain supported. `SUPPORTS_REPLACE_TABLE=False` remains accurate.
+- DataFrame/Seed/Python model writes, grants, MANAGED, WAP, clone, multi-catalog, MaxCompute state backend, and atomic replacement are unsupported. Pandas query-result reads are supported.
+- MV `disable_rewrite` is rendered and unit tested, but the `york_fic` parser rejected it.
+- Dedicated gated integration tests are used instead of the shared cloud harness because the generic harness performs schema and data writes that are unsafe for the protected project.
+- Every protected real test inventories and restores `york_fic.sqlmesh`, removes only UUID-scoped objects plus replacement tables with the corresponding generated `__temp_` prefixes, and never calls `Context.destroy()`.
+
+| Capability group | Status | Evidence boundary |
+| --- | --- | --- |
+| Core, partition, transactional, SCD2, EXTERNAL/EMBEDDED models | Real / Unit | Model workflows and repeated two-day automatic overwrite are Real; automatic source-type validation is Unit |
+| Materialized views and audit | Real | Dedicated gated evaluator tests on `york_fic.sqlmesh`; MV janitor type routing is Unit |
+| Lifecycle and janitor | Real | Environment/snapshot cleanup through the dedicated gated lifecycle test |
+| Comments, reads/diffs, metadata, rename and truncate | Real / Unit | Core operations are Real; partition-column comment and no-schema logical rename boundary are Unit |
+| Regular View storage-property rejection | Unit | Only materialized views accept materialized/storage properties |
+| Schema evolution and MV `disable_rewrite` | Unit | Target project/parser capability unavailable |
+| Native temporal type rendering and implicit partition guard | Unit | `DATETIME`/`TIMESTAMP_NTZ` remain native; all four temporal types require explicit `TRUNC_TIME` with `partition_interval` |
+| MaxQA | Unit | Mapping and gated test exist; no quota available |
+| Data writes from Python/DataFrame/Seed and administrative features | Unsupported | Explicit adapter boundary |
 
 **Goal:** Add a built-in SQLMesh `maxcompute` execution adapter that can plan and apply supported offline SQL models against Alibaba Cloud MaxCompute/ODPS while keeping SQLMesh state in an external state backend.
 
@@ -35,31 +48,27 @@ Known boundaries in the latest code:
 
 ## In Scope
 
-- `type: maxcompute` execution connection.
-- `VIEW`, `FULL`, and partition-aligned `INCREMENTAL_BY_TIME_RANGE` model execution paths.
-- MaxCompute SQL rendering for `CREATE SCHEMA`, `DROP SCHEMA`, `CREATE TABLE`, `CREATE VIEW`, `DROP TABLE`, `DROP VIEW`, `INSERT INTO`, `INSERT OVERWRITE TABLE`, and `INSERT OVERWRITE TABLE ... PARTITION (...)`.
-- Two-step create/write path for partitioned tables or tables with `lifecycle` / table properties.
-- Dynamic partition projection ordering with normal columns first and partition columns last.
-- `physical_properties (lifecycle = n)` rendered as `LIFECYCLE n`, not as `TBLPROPERTIES`.
-- PyODPS metadata methods for `columns`, `table_exists`, and `_get_data_objects`.
-- Unit tests using mocked adapter and mocked PyODPS objects.
-- A gated real MaxCompute smoke test fixture that runs only when credentials are present.
-- Documentation for supported workflows and state connection separation.
-- No-schema namespace projects, by folding logical SQLMesh schemas into MaxCompute object names.
+- `type: maxcompute` execution connection with offline and MaxQA modes.
+- Schema namespace and no-schema folded object naming.
+- Supported SQL model kinds listed in the current status, including transactional UNIQUE_KEY/SCD2 and materialized views.
+- Manual partitions and explicit `TRUNC_TIME` automatic time partitions, including bounded temporary replacement for time-range overwrite; `INCREMENTAL_BY_PARTITION` remains simple-column only.
+- Lifecycle, comments including manual partition-column creation syntax, transactional properties, primary/write buckets, and HASH clustering.
+- DDL/DML, PyODPS metadata, Pandas query reads, RowDiff/TableDiff, rename, truncate, and validated schema evolution.
+- Gated real MaxCompute audit, capability, transactional, model-kind, no-schema, schema, lifecycle, and MaxQA tests.
+- DuckDB file state for real verification and documentation of external production state separation.
 
 ## Out Of Scope
 
 - SQLMesh state sync stored in MaxCompute.
-- Python models and pandas DataFrame writes.
-- Materialized views.
-- SCD Type 2 models.
+- Python model, Seed, and pandas DataFrame writes.
 - Grants.
 - Full table atomic replace guarantees.
 - Automatic conversion from arbitrary SQL dialects to MaxCompute SQL.
 - Cross-project catalog behavior beyond mapping `project` to default catalog.
 - MaxCompute project/user/role administration.
-- MaxQA/MCQA execution mode.
-- Transform partition expressions such as `DATE(ds)`.
+- MANAGED, WAP, clone, and multi-catalog workflows.
+- Implicit partition transformations such as `DATE(ds)`; automatic partitioning requires explicit `TRUNC_TIME`.
+- PostgreSQL state plus MaxCompute execution real integration coverage for this iteration.
 
 ## Reference Notes
 
@@ -1466,6 +1475,8 @@ Expected without credentials: SKIPPED. Expected with credentials: PASS, creating
 
 ### Task 10: Add User Documentation
 
+> Historical note: this task records the minimum documentation proposed for the first adapter version. The effective user documentation and the status sections above supersede its original `Supported Models` / `Unsupported In The First Version` lists.
+
 **Files:**
 - Create: `docs/integrations/engines/maxcompute.md`
 - Modify: `docs/integrations/engines.md` if this index exists
@@ -1589,76 +1600,98 @@ Expected: PASS and `rg` prints all four required topics.
 
 ## Final Exit Criteria
 
-- `type: maxcompute` parses as a valid execution connection.
-- `maxcompute` is forbidden as a state sync engine.
-- `create_engine_adapter(..., dialect="maxcompute")` returns `MaxComputeEngineAdapter`.
-- Supported DDL/DML renders MaxCompute-compatible SQL.
-- No path generates `CREATE TABLE target (cols) AS SELECT ...` or `CREATE TABLE target (cols) PARTITIONED BY (...) AS SELECT ...`.
-- Partition definitions are removed from the main column list and rendered in `PARTITIONED BY (...)`.
-- `lifecycle` renders as `LIFECYCLE n` and is removed from `TBLPROPERTIES`.
-- Dynamic partition overwrite renders `INSERT OVERWRITE TABLE target PARTITION (...) SELECT normal_cols..., partition_cols...`.
-- Partition projection order is verified exactly in tests, including a computed expression such as `price * quantity AS amount` so the implementation cannot rebuild projections as bare alias references.
-- Metadata methods use PyODPS object APIs, not `DESCRIBE` text parsing.
-- `VIEW`, `FULL`, and partition-aligned `INCREMENTAL_BY_TIME_RANGE` paths have unit coverage.
-- Gated real MaxCompute smoke test skips cleanly without credentials and passes with credentials.
-- User documentation explains scope, configuration, state connection separation, and non-transactional semantics.
-- Shared evaluator changes pass `tests/core/test_snapshot_evaluator.py` and `tests/core/engine_adapter/` regression checks.
-- After the implementing AI completes all tasks, it must summarize changes and wait for Claude code review before further iteration.
+- [x] `type: maxcompute`, adapter registration, dialect extension and external state separation are implemented.
+- [x] Invalid explicit-column CTAS is avoided; lifecycle, comments, partition and other physical properties use create+write when required.
+- [x] Manual dynamic partition writes preserve computed expressions and move partition projections to the end.
+- [x] Explicit `TRUNC_TIME` automatic partitioning validates `DATE`/`DATETIME`/`TIMESTAMP`/`TIMESTAMP_NTZ` sources before DDL and rejects non-temporal types; native `DATETIME`/`TIMESTAMP_NTZ` rendering and the four-type implicit `partition_interval` guard have Unit coverage; append omits the DML `PARTITION` clause, while time-range overwrite requires a bounded condition, validates actual target generated-expression metadata, and uses a `LIFECYCLE 1` temporary full replacement that preserves unaffected partitions.
+- [x] FULL, VIEW, MV, time/partition/unmanaged/unique-key incremental, both SCD2 kinds, EXTERNAL and EMBEDDED have gated Real evidence.
+- [x] Transactional properties, optional primary key/write bucket, native MERGE and SCD2 restrictions are enforced.
+- [x] Table/non-partition comments, fetchdf, RowDiff/TableDiff, metadata, schema-enabled rename and truncate are covered by the dedicated capability smoke.
+- [x] A two-day `york_fic` smoke passed again with actual PyODPS metadata, verifying automatic time-range overwrite replaces the bounded day and preserves the unaffected day.
+- [x] Regular View storage-property rejection, no-schema same-logical-namespace rename validation, and manual partition-column comment rendering have Unit coverage.
+- [x] Schema-enabled and no-schema namespace paths have independent Real evidence.
+- [x] Audit, manual/auto restatement, cron, `Context.run()`, janitor and lifecycle pass with DuckDB file state.
+- [x] Protected real tests restore `york_fic.sqlmesh` to its pre-test object set and never call `Context.destroy()`.
+- [x] Unsupported write/model/administration features fail explicitly or remain capability-disabled.
+- [ ] Schema evolution awaits a project with schema-evolution DDL enabled.
+- [ ] MV `disable_rewrite` awaits an instance whose parser supports the clause.
+- [ ] MaxQA awaits an available test quota; config, mapping and gated read-only coverage are complete.
 
 ## Validation Command Package
 
-Run the focused package first:
-
-```bash
-pytest tests/core/engine_adapter/test_maxcompute.py tests/core/test_connection_config.py::test_maxcompute_connection_config tests/core/test_dialect.py::test_maxcompute_dialect_alias_extends_sqlmesh_model_syntax -v
-```
-
-Run the gated integration smoke:
-
-```bash
-pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py -v
-```
-
-Run broader related checks:
-
-```bash
-pytest tests/core/engine_adapter/test_maxcompute.py tests/core/test_connection_config.py tests/core/test_dialect.py -v
-```
-
-Run shared evaluator and adapter regression checks because Task 6 changes `IncrementalByTimeRangeStrategy` for every engine:
-
-```bash
-pytest tests/core/test_snapshot_evaluator.py tests/core/engine_adapter/ -v
-```
-
-Run style before handoff:
-
-```bash
-make style
-```
-
-Latest focused verification package used during implementation:
+Run local tests first:
 
 ```bash
 .venv312/bin/python -m pytest tests/core/engine_adapter/test_maxcompute.py -q
-.venv312/bin/python -m pytest tests/core/test_snapshot_evaluator.py -q -k 'not materialized_view_with_partitioned_by_cluster_by'
+.venv312/bin/python -m pytest tests/core/test_connection_config.py -q -k maxcompute
+.venv312/bin/python -m pytest tests/core/test_snapshot_evaluator.py -q
 .venv312/bin/python -m pytest tests/core/engine_adapter/test_base.py -q
-ruff check sqlmesh/core/engine_adapter/maxcompute.py sqlmesh/core/config/connection.py sqlmesh/core/snapshot/evaluator.py tests/core/engine_adapter/test_maxcompute.py tests/core/engine_adapter/integration/test_integration_maxcompute.py tests/core/test_connection_config.py tests/core/test_dialect.py
-ruff format --check sqlmesh/core/engine_adapter/maxcompute.py sqlmesh/core/config/connection.py sqlmesh/core/snapshot/evaluator.py tests/core/engine_adapter/test_maxcompute.py tests/core/engine_adapter/integration/test_integration_maxcompute.py tests/core/test_connection_config.py tests/core/test_dialect.py
+.venv312/bin/python -m pytest tests/core/test_janitor.py -q
+make style
 ```
 
-Real MaxCompute verification used during implementation:
+Real tests require credentials through environment variables. Schema-enabled write tests use the protected pre-created namespace:
 
 ```bash
-MAXCOMPUTE_PROJECT=... \
-MAXCOMPUTE_ENDPOINT=... \
-MAXCOMPUTE_ACCESS_KEY_ID=... \
-MAXCOMPUTE_ACCESS_KEY_SECRET=... \
-MAXCOMPUTE_SCHEMA_SMOKE=1 \
-.venv312/bin/python -m pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_smoke_plan_apply -v
+export MAXCOMPUTE_PROJECT=york_fic
+export MAXCOMPUTE_SCHEMA=sqlmesh
+export MAXCOMPUTE_ENDPOINT=https://service.cn-hangzhou.maxcompute.aliyun.com/api
+export MAXCOMPUTE_ACCESS_KEY_ID=...
+export MAXCOMPUTE_ACCESS_KEY_SECRET=...
 ```
 
-The real smoke suite validates both namespace modes. The no-schema case reads back folded objects named `analytics__<model>`. The opt-in schema-enabled case has passed on `york_fic`: it creates a random `sqlmesh_smoke_<random>` schema, configures both the connection and physical mapping to use it, runs `Context.plan(no_prompts=True)` and repeated `Context.apply()`, verifies FULL and partitioned incremental data, and drops the isolated schema. It does not operate on the default namespace. This also verifies that an explicit connection schema enables schema behavior when PyODPS tenant detection returns false.
+Run each capability through its independent gate:
+
+```bash
+MAXCOMPUTE_AUDIT_SMOKE=1 .venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_real_audit_execution -v
+
+MAXCOMPUTE_CAPABILITY_SMOKE=1 .venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_adapter_capabilities -v
+
+MAXCOMPUTE_TRANSACTIONAL_SMOKE=1 .venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_transactional_models_plan_apply -v
+
+MAXCOMPUTE_MODEL_KIND_SMOKE=1 .venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_additional_model_kinds_plan_apply -v
+
+MAXCOMPUTE_LIFECYCLE_SMOKE=1 .venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_lifecycle_restate_janitor -v
+```
+
+Schema evolution is nested inside the capability test and has an additional opt-in:
+
+```bash
+MAXCOMPUTE_CAPABILITY_SMOKE=1 \
+MAXCOMPUTE_SCHEMA_EVOLUTION_SMOKE=1 \
+.venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_adapter_capabilities -v
+```
+
+The target project must enable schema-evolution DDL. `york_fic` currently does not, so the regular capability smoke leaves this segment disabled.
+
+The no-schema test uses a separate project and requires `MAXCOMPUTE_SCHEMA` to be unset:
+
+```bash
+unset MAXCOMPUTE_SCHEMA
+MAXCOMPUTE_PROJECT=york_data \
+MAXCOMPUTE_NO_SCHEMA_SMOKE=1 \
+.venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_no_schema_smoke_plan_apply -v
+```
+
+The earlier schema smoke remains separately gated with `MAXCOMPUTE_SCHEMA_SMOKE=1`. MaxQA requires a real quota and is read-only:
+
+```bash
+MAXCOMPUTE_MAXQA_SMOKE=1 \
+MAXCOMPUTE_QUOTA_NAME=... \
+.venv312/bin/python -m pytest \
+  tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_maxqa_query -v
+```
+
+The complete gate list is `MAXCOMPUTE_SCHEMA_SMOKE`, `MAXCOMPUTE_NO_SCHEMA_SMOKE`, `MAXCOMPUTE_AUDIT_SMOKE`, `MAXCOMPUTE_CAPABILITY_SMOKE`, `MAXCOMPUTE_SCHEMA_EVOLUTION_SMOKE`, `MAXCOMPUTE_TRANSACTIONAL_SMOKE`, `MAXCOMPUTE_MODEL_KIND_SMOKE`, `MAXCOMPUTE_LIFECYCLE_SMOKE`, and `MAXCOMPUTE_MAXQA_SMOKE`.
+
+All real lifecycle/audit/capability tests use DuckDB file state. No PostgreSQL state combination is part of this plan.
 
 ## Execution Recommendation Order
 
@@ -1673,14 +1706,24 @@ The real smoke suite validates both namespace modes. The no-schema case reads ba
 9. Task 9: Add gated real MaxCompute smoke test.
 10. Task 10: Add documentation.
 
+Capability-extension execution order after the original ten tasks:
+
+1. Centralize namespace normalization and inherited DDL/DML behavior.
+2. Add metadata, read, comments, rename, truncate and schema-evolution contracts.
+3. Add transactional UNIQUE_KEY/SCD2 support.
+4. Add automatic partitions, HASH clustering and materialized views.
+5. Add MaxQA configuration and dedicated gated real harnesses.
+6. Run developer -> code-reviewer iteration and update user/design/plan documentation.
+
 ## Highest Risk 3 Points
 
-1. **SQLGlot dialect alias limitations:** `maxcompute` is backed by Hive syntax, so any MaxCompute-specific DDL/DML must be rendered explicitly by the adapter instead of relying on generic AST serialization.
-2. **Dynamic partition projection order and expression preservation:** The adapter must never rely on source query order or dictionary insertion order for partition overwrite, and it must move existing projection expressions instead of rebuilding bare column references. Tests must assert exact SQL projection order and include computed aliases.
-3. **PyODPS runtime semantics:** DBAPI execution, schema namespace behavior, view replacement, and not-found exceptions can vary by MaxCompute project configuration. Re-check `ODPS.__init__` kwargs during Task 2, keep the unit implementation narrow, and use the gated smoke test to validate real behavior.
+1. **Project capability variation:** schema evolution and MV `DISABLE REWRITE` are accepted by local rendering but unavailable on `york_fic`; documentation and tests must not promote them to Real without a capable project.
+2. **Non-atomic replacement:** `SUPPORTS_REPLACE_TABLE=False` is intentional. Full-table and MV drop/create flows can leave intermediate state and must remain rerunnable.
+3. **Protected namespace safety:** shared generic cloud tests are too broad. Gated tests must keep strict project/schema assertions, UUID cleanup, complete object-inventory restoration, and the prohibition on `Context.destroy()`.
 
 ## Remaining Follow-Ups
 
-1. Validate `CREATE OR REPLACE VIEW` across more MaxCompute project configurations; add drop/create fallback only if a real target requires it.
-2. Expand real schema/type fixtures for nested `struct`, `array`, and `map` edge cases.
-3. Design MCQA/MaxQA execution separately from the current PyODPS offline DBAPI path.
+1. Run the existing MaxQA read-only gate when an approved `MAXCOMPUTE_QUOTA_NAME` becomes available.
+2. Re-run the nested schema-evolution segment on a project with schema-evolution DDL enabled.
+3. Re-evaluate MV `disable_rewrite` only on an instance whose parser supports the clause.
+4. Expand real nested `struct`, `array`, and `map` metadata fixtures without touching the business default schema.

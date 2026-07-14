@@ -2068,9 +2068,21 @@ def _adjust_physical_properties_for_engine(
         or kind.is_scd_type_2
         or (isinstance(kind, IncrementalUnmanagedKind) and kind.insert_overwrite)
     )
+    if (
+        isinstance(kind, IncrementalUnmanagedKind)
+        and kind.insert_overwrite
+        and not model.partitioned_by
+        and not adapter.SUPPORTS_UNPARTITIONED_INSERT_OVERWRITE
+    ):
+        raise SQLMeshError(
+            f"Engine '{adapter.dialect}' does not support unpartitioned "
+            f"INCREMENTAL_UNMANAGED insert overwrite for model '{model.name}'"
+        )
 
     return adapter.adjust_physical_properties_for_incremental(
         dict(physical_properties or {}),
+        model_kind=kind,
+        partitioned_by=model.partitioned_by,
         requires_delete_capable_table=requires_delete_capable_table,
         unique_key=model.unique_key if kind.is_incremental_by_unique_key else None,
         model_name=model.name,

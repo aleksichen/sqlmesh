@@ -1021,16 +1021,6 @@ class _Model(ModelMeta, frozen=True):
                 self._path,
             )
 
-        if (
-            self.kind.is_incremental_unmanaged
-            and getattr(self.kind, "insert_overwrite", False)
-            and not self.partitioned_by_
-        ):
-            raise_config_error(
-                "Unmanaged incremental models with insert / overwrite enabled must specify the partitioned_by field",
-                self._path,
-            )
-
         if self.kind.is_managed:
             # TODO: would this sort of logic be better off moved into the Kind?
             if self.dialect == "snowflake" and "target_lag" not in self.physical_properties:

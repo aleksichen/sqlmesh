@@ -29,6 +29,7 @@ from sqlmesh.utils.errors import SQLMeshError
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
     from sqlmesh.core.engine_adapter._typing import QueryOrDF
+    from sqlmesh.core.model import ModelKind
 
 logger = logging.getLogger(__name__)
 
@@ -2129,6 +2130,8 @@ class StarRocksEngineAdapter(
         self,
         physical_properties: t.Dict[str, t.Any],
         *,
+        model_kind: ModelKind,
+        partitioned_by: t.List[exp.Expr],
         requires_delete_capable_table: bool,
         unique_key: t.Optional[t.List[exp.Expr]],
         model_name: str,

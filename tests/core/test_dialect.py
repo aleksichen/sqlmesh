@@ -19,6 +19,14 @@ from sqlmesh.core.config.connection import DIALECT_TO_TYPE
 pytestmark = pytest.mark.dialect_isolated
 
 
+@pytest.mark.parametrize(
+    ("data_type", "expected_sql"),
+    [("datetime", "DATETIME"), ("timestamp_ntz", "TIMESTAMP_NTZ")],
+)
+def test_maxcompute_preserves_native_temporal_types(data_type: str, expected_sql: str) -> None:
+    assert exp.DataType.build(data_type).sql(dialect="maxcompute") == expected_sql
+
+
 def test_format_model_expressions():
     x = format_model_expressions(
         parse(

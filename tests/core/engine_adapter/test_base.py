@@ -14,6 +14,7 @@ from sqlmesh.core import dialect as d
 from sqlmesh.core.dialect import normalize_model_name
 from sqlmesh.core.engine_adapter import EngineAdapter, EngineAdapterWithIndexSupport
 from sqlmesh.core.engine_adapter.shared import InsertOverwriteStrategy, DataObject
+from sqlmesh.core.model import IncrementalByPartitionKind
 from sqlmesh.core.schema_diff import SchemaDiffer, TableAlterOperation, NestedSupport
 from sqlmesh.utils import columns_to_types_to_struct
 from sqlmesh.utils.date import to_ds
@@ -22,6 +23,25 @@ from tests.core.engine_adapter import to_sql_calls
 
 
 pytestmark = pytest.mark.engine
+
+
+def test_adjust_physical_properties_for_incremental_is_noop(
+    make_mocked_engine_adapter: t.Callable,
+) -> None:
+    adapter = make_mocked_engine_adapter(EngineAdapter)
+    physical_properties = {"partition_type": exp.Literal.string("LIST")}
+
+    assert (
+        adapter.adjust_physical_properties_for_incremental(
+            physical_properties,
+            model_kind=IncrementalByPartitionKind(),
+            partitioned_by=[exp.column("ds")],
+            requires_delete_capable_table=True,
+            unique_key=None,
+            model_name="db.model",
+        )
+        is physical_properties
+    )
 
 
 def test_create_view(make_mocked_engine_adapter: t.Callable):

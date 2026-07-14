@@ -2472,11 +2472,12 @@ class MaxComputeConnectionConfig(ConnectionConfig):
     security_token: t.Optional[str] = None
     tunnel_endpoint: t.Optional[str] = None
     quota_name: t.Optional[str] = None
-    execution_mode: t.Literal["offline"] = "offline"
+    execution_mode: t.Literal["offline", "maxqa"] = "offline"
+    maxqa_fallback_policy: t.Literal["none", "default", "all"] = "none"
     sql_hints: t.Dict[str, str] = Field(default_factory=dict)
 
     concurrent_tasks: int = 1
-    register_comments: t.Literal[False] = False
+    register_comments: bool = False
     pre_ping: t.Literal[False] = False
 
     type_: t.Literal["maxcompute"] = Field(alias="type", default="maxcompute")
@@ -2485,6 +2486,12 @@ class MaxComputeConnectionConfig(ConnectionConfig):
     DISPLAY_ORDER: t.ClassVar[t.Literal[19]] = 19
 
     _engine_import_validator = _get_engine_import_validator("odps", "maxcompute")
+
+    @model_validator(mode="after")
+    def _validate_maxqa_config(self) -> Self:
+        if self.execution_mode == "maxqa" and not self.quota_name:
+            raise ConfigError("MaxCompute MaxQA execution mode requires 'quota_name'")
+        return self
 
     @property
     def _connection_kwargs_keys(self) -> t.Set[str]:
@@ -2515,6 +2522,11 @@ class MaxComputeConnectionConfig(ConnectionConfig):
             "hints": dict(self.sql_hints),
             "quota_name": self.quota_name,
         }
+        if self.execution_mode == "maxqa":
+            kwargs["use_sqa"] = "v2"
+            kwargs["fallback_policy"] = (
+                "" if self.maxqa_fallback_policy == "none" else self.maxqa_fallback_policy
+            )
         if self.security_token:
             kwargs["account"] = self._sts_account()
         else:

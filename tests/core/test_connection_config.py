@@ -1380,6 +1380,8 @@ def test_maxcompute_connection_config(make_config):
     assert config.concurrent_tasks == 1
     assert config.register_comments is False
     assert config.pre_ping is False
+    assert config.execution_mode == "offline"
+    assert config.maxqa_fallback_policy == "none"
     assert config.get_catalog() == "warehouse"
     assert config.is_recommended_for_state_sync is False
     assert config.is_forbidden_for_state_sync is True
@@ -1392,6 +1394,22 @@ def test_maxcompute_connection_config(make_config):
     assert kwargs["hints"] == {"odps.sql.allow.fullscan": "true"}
     assert kwargs["quota_name"] == "default"
     assert "security_token" not in kwargs
+    assert "use_sqa" not in kwargs
+    assert "fallback_policy" not in kwargs
+
+
+def test_maxcompute_connection_config_can_enable_comments(make_config):
+    config = make_config(
+        type="maxcompute",
+        project="warehouse",
+        endpoint="https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+        access_key_id="ak",
+        access_key_secret="sk",
+        register_comments=True,
+        check_import=False,
+    )
+
+    assert config.register_comments is True
 
 
 @pytest.mark.parametrize(
@@ -1425,14 +1443,43 @@ def test_maxcompute_connection_factory_marks_configured_schema(
     odps_connect.assert_called_once()
 
 
-def test_maxcompute_rejects_maxqa_execution_mode(make_config):
-    with pytest.raises(ConfigError, match="execution_mode"):
+@pytest.mark.parametrize(
+    ("maxqa_fallback_policy", "fallback_policy"),
+    [("none", ""), ("default", "default"), ("all", "all")],
+)
+def test_maxcompute_maxqa_connection_kwargs(
+    make_config, maxqa_fallback_policy: str, fallback_policy: str
+) -> None:
+    config = make_config(
+        type="maxcompute",
+        project="warehouse",
+        endpoint="https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+        access_key_id="ak",
+        access_key_secret="sk",
+        quota_name="interactive",
+        execution_mode="maxqa",
+        maxqa_fallback_policy=maxqa_fallback_policy,
+        check_import=False,
+    )
+
+    assert isinstance(config, MaxComputeConnectionConfig)
+    assert config.execution_mode == "maxqa"
+    assert config.maxqa_fallback_policy == maxqa_fallback_policy
+    assert config._static_connection_kwargs["quota_name"] == "interactive"
+    assert config._static_connection_kwargs["use_sqa"] == "v2"
+    assert config._static_connection_kwargs["fallback_policy"] == fallback_policy
+
+
+@pytest.mark.parametrize("quota_name", [None, ""])
+def test_maxcompute_maxqa_requires_quota_name(make_config, quota_name: t.Optional[str]) -> None:
+    with pytest.raises(ConfigError, match="quota_name"):
         make_config(
             type="maxcompute",
             project="warehouse",
             endpoint="https://service.cn-hangzhou.maxcompute.aliyun.com/api",
             access_key_id="ak",
             access_key_secret="sk",
+            quota_name=quota_name,
             execution_mode="maxqa",
             check_import=False,
         )

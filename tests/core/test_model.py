@@ -4061,11 +4061,7 @@ def test_incremental_unmanaged_validation():
         kind=IncrementalUnmanagedKind(insert_overwrite=True),
     )
 
-    with pytest.raises(
-        ConfigError,
-        match=r"Unmanaged incremental models with insert / overwrite enabled must specify the partitioned_by field.*",
-    ):
-        model.validate_definition()
+    model.validate_definition()
 
     model = model.copy(update={"partitioned_by_": [exp.to_column("ds")]})
     model.validate_definition()
