@@ -1,5 +1,6 @@
 import typing as t
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from sqlglot import exp, parse_one
@@ -175,6 +176,27 @@ def test_maxcompute_lifecycle_ctas_uses_create_then_insert(
         "CREATE TABLE IF NOT EXISTS `analytics`.`orders` (`order_id` BIGINT) LIFECYCLE 7",
         "INSERT INTO `analytics`.`orders` (`order_id`) SELECT 1 AS `order_id`",
     ]
+
+
+def test_maxcompute_lifecycle_replace_query_uses_create_then_insert(
+    adapter: MaxComputeEngineAdapter, mocker
+) -> None:
+    mocker.patch.object(adapter, "get_data_object", return_value=None)
+    execute = mocker.spy(adapter, "execute")
+
+    adapter.replace_query(
+        "analytics.orders",
+        query_or_df=parse_one("SELECT 1 AS order_id"),
+        target_columns_to_types={"order_id": exp.DataType.build("bigint")},
+        table_properties={"lifecycle": exp.Literal.number(7)},
+        track_rows_processed=False,
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `analytics`.`orders` (`order_id` BIGINT) LIFECYCLE 7",
+        "INSERT INTO `analytics`.`orders` (`order_id`) SELECT 1 AS `order_id`",
+    ]
+    assert execute.call_args_list[1].kwargs["track_rows_processed"] is False
 
 
 def test_maxcompute_insert_append(adapter: MaxComputeEngineAdapter) -> None:
@@ -551,6 +573,55 @@ def test_maxcompute_no_schema_create_schema_is_noop(
     adapter.create_schema("warehouse")
 
     assert to_sql_calls(adapter) == []
+
+
+def test_maxcompute_configured_schema_marker_enables_schema_namespace(
+    make_mocked_engine_adapter: t.Callable,
+) -> None:
+    adapter = make_mocked_engine_adapter(
+        MaxComputeEngineAdapter,
+        register_comments=False,
+        default_catalog="york_fic",
+        patch_get_data_objects=False,
+    )
+    adapter.connection._sqlmesh_schema_namespace_configured = True
+
+    class ODPS:
+        is_schema_namespace_enabled = MagicMock(side_effect=AssertionError("unexpected call"))
+
+        @property
+        def schema(self) -> t.NoReturn:
+            raise AssertionError("odps.schema must not be read")
+
+    adapter.connection.odps = ODPS()
+
+    adapter.create_schema("sqlmesh_smoke_1234")
+
+    assert to_sql_calls(adapter) == ["CREATE SCHEMA IF NOT EXISTS `sqlmesh_smoke_1234`"]
+
+
+def test_maxcompute_schema_namespace_detection_does_not_read_odps_schema(
+    make_mocked_engine_adapter: t.Callable,
+) -> None:
+    adapter = make_mocked_engine_adapter(
+        MaxComputeEngineAdapter,
+        register_comments=False,
+        default_catalog="warehouse",
+        patch_get_data_objects=False,
+    )
+
+    class ODPS:
+        is_schema_namespace_enabled = MagicMock(return_value=False)
+
+        @property
+        def schema(self) -> t.NoReturn:
+            raise AssertionError("odps.schema must not be read")
+
+    odps = ODPS()
+    adapter.connection.odps = odps
+
+    assert adapter._is_schema_namespace_enabled() is False
+    odps.is_schema_namespace_enabled.assert_called_once_with()
 
 
 def test_maxcompute_no_schema_create_table_folds_schema_into_table_name(

@@ -49,6 +49,12 @@ class MaxComputeEngineAdapter(EngineAdapter):
 
     def _is_schema_namespace_enabled(self) -> bool:
         try:
+            if vars(self.connection).get("_sqlmesh_schema_namespace_configured", False):
+                return True
+        except TypeError:
+            pass
+
+        try:
             return bool(self.odps.is_schema_namespace_enabled())
         except Exception:
             return True
@@ -140,6 +146,19 @@ class MaxComputeEngineAdapter(EngineAdapter):
             for source_query in source_queries:
                 source_query.add_transform(self._normalize_table_expression)
 
+        if self._requires_two_step_ctas(**kwargs):
+            self._create_then_insert_source_queries(
+                table_name,
+                source_queries,
+                target_columns_to_types or {},
+                exists=exists,
+                table_description=table_description,
+                column_descriptions=column_descriptions,
+                track_rows_processed=track_rows_processed,
+                **kwargs,
+            )
+            return
+
         return super()._create_table_from_source_queries(
             table_name,
             source_queries,
@@ -216,24 +235,13 @@ class MaxComputeEngineAdapter(EngineAdapter):
         target_columns_to_types = target_columns_to_types or {}
 
         if self._requires_two_step_ctas(**kwargs):
-            self.create_table(
+            self._create_then_insert_source_queries(
                 table_name,
-                target_columns_to_types=target_columns_to_types,
+                source_queries,
+                target_columns_to_types,
                 exists=exists,
                 **kwargs,
             )
-            if kwargs.get("partitioned_by"):
-                self._insert_source_queries_by_partition(
-                    table_name,
-                    source_queries,
-                    partitioned_by=kwargs["partitioned_by"],
-                    target_columns_to_types=target_columns_to_types,
-                    overwrite=True,
-                )
-            else:
-                for source_query in source_queries:
-                    with source_query as query:
-                        self._insert_append_query(table_name, query, target_columns_to_types)
             return
 
         table = self._normalize_table(table_name)
@@ -247,6 +255,41 @@ class MaxComputeEngineAdapter(EngineAdapter):
                     f"{query.sql(dialect=self.dialect, identify=True)}"
                 )
                 self._clear_data_object_cache(table)
+
+    def _create_then_insert_source_queries(
+        self,
+        table_name: TableName,
+        source_queries: t.List[SourceQuery],
+        target_columns_to_types: t.Dict[str, exp.DataType],
+        exists: bool,
+        track_rows_processed: bool = True,
+        **kwargs: t.Any,
+    ) -> None:
+        self.create_table(
+            table_name,
+            target_columns_to_types=target_columns_to_types,
+            exists=exists,
+            **kwargs,
+        )
+        if kwargs.get("partitioned_by"):
+            self._insert_source_queries_by_partition(
+                table_name,
+                source_queries,
+                partitioned_by=kwargs["partitioned_by"],
+                target_columns_to_types=target_columns_to_types,
+                overwrite=True,
+                track_rows_processed=track_rows_processed,
+            )
+            return
+
+        for source_query in source_queries:
+            with source_query as query:
+                self._insert_append_query(
+                    table_name,
+                    query,
+                    target_columns_to_types,
+                    track_rows_processed=track_rows_processed,
+                )
 
     def create_view(
         self,
@@ -377,6 +420,7 @@ class MaxComputeEngineAdapter(EngineAdapter):
         target_columns_to_types: t.Dict[str, exp.DataType],
         where: t.Optional[exp.Condition] = None,
         overwrite: bool = True,
+        track_rows_processed: bool = True,
     ) -> None:
         projection_order = self._projection_order_for_partition_overwrite(
             target_columns_to_types, partitioned_by
@@ -400,7 +444,7 @@ class MaxComputeEngineAdapter(EngineAdapter):
                     f"{table.sql(dialect=self.dialect, identify=True)} "
                     f"PARTITION ({partition_sql}) "
                     f"{ordered_query.sql(dialect=self.dialect, identify=True)}",
-                    track_rows_processed=True,
+                    track_rows_processed=track_rows_processed,
                 )
 
     def _insert_append_query(

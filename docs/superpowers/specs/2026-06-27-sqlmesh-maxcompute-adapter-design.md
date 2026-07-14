@@ -1,6 +1,6 @@
 # SQLMesh MaxCompute Adapter 能力设计
 
-## 当前实现状态（2026-06-28）
+## 当前实现状态（2026-07-14）
 
 本设计已经落地为当前分支的 `MaxComputeEngineAdapter` 和 `MaxComputeConnectionConfig`。实现状态如下：
 
@@ -11,6 +11,8 @@
 - 已补齐非分区 FULL 既有表 replacement 的 `INSERT OVERWRITE TABLE target SELECT ...` 位置匹配路径，不渲染 overwrite 列清单。
 - 已支持 no-schema namespace MaxCompute project：跳过 `CREATE/DROP SCHEMA`，将 SQLMesh 逻辑 schema 折叠进对象名，例如 `analytics.dim_customer` 渲染为 `analytics__dim_customer`。
 - 已通过真实 MaxCompute no-schema project 的 `Context.plan()` + 两次 `Context.apply()` smoke，覆盖 FULL、分区增量、view/table 可读性和幂等 apply。
+- 已将显式 connection `schema` 视为 schema namespace 启用信号；即使 PyODPS tenant detection 返回 false，也保持 schema-qualified DDL、DML 和 metadata 语义。
+- 已在真实 `york_fic` project 中通过 schema-enabled `Context.plan()` + 两次 `Context.apply()` smoke。测试仅在 `MAXCOMPUTE_SCHEMA_SMOKE` 显式 opt-in 时运行，使用随机隔离的 `sqlmesh_smoke_<random>` schema，并且不触碰 default namespace。
 - 当前仅支持 `execution_mode: offline`；`maxqa` / MCQA 执行模式未实现且配置会被拒绝。
 - 当前 `partitioned_by` 仅支持简单列引用，不支持 `DATE(ds)` 等 transform partition。
 
@@ -238,14 +240,14 @@ state sync 行为：
 
 ### 8.4 Schema Namespace 规则
 
-adapter 运行时调用 `odps.is_schema_namespace_enabled()` 判断目标 project 是否启用 schema namespace。如果该调用失败，默认按启用 schema namespace 处理，避免误跳过合法 schema 行为。
+adapter 运行时结合 `odps.is_schema_namespace_enabled()` 和 connection 上的显式 `schema` 判断是否启用 schema namespace。任一条件成立都按 schema namespace 启用处理，因此显式 connection `schema` 会覆盖 PyODPS tenant detection 的 false 结果。如果 detection 调用失败，仍默认按启用 schema namespace 处理，避免误跳过合法 schema 行为。
 
 schema namespace 启用时：
 
 - 表名、视图名和 metadata API 保持 `project.schema.object` 语义。
 - `CREATE SCHEMA` / `DROP SCHEMA` 会发送给 MaxCompute。
 
-schema namespace 未启用时：
+schema namespace 未启用且 connection 未配置 `schema` 时：
 
 - `CREATE SCHEMA` / `DROP SCHEMA` 直接 no-op。
 - DDL/DML 中清空 table 的 `catalog` 和 `db`，将 `db + name` 折叠为单段对象名。
@@ -495,20 +497,24 @@ adapter 应遵循以下原则：
 
 ### Phase 2：真实 MaxCompute Smoke Test
 
-状态：已完成 no-schema project 覆盖。
+状态：已完成 no-schema project 和 schema-enabled `york_fic` project 覆盖。
 
 交付内容：
 
 - 内部集成 fixture：`tests/core/engine_adapter/integration/test_integration_maxcompute.py`。
 - 使用真实 MaxCompute 凭证的 gated smoke test。
 - smoke 使用 DuckDB state connection，避免测试依赖外部 Postgres。
-- smoke 覆盖 no-schema namespace project；schema namespace enabled project 会 skip。
+- no-schema smoke 在凭证可用时运行；schema namespace enabled project 会 skip 这条用例。
+- schema-enabled smoke 仅在 `MAXCOMPUTE_SCHEMA_SMOKE` 显式 opt-in 时运行，避免凭证存在时意外执行 schema DDL。
+- schema-enabled smoke 先执行只读 schema listing 能力检查，再创建随机隔离的 `sqlmesh_smoke_<random>` schema；connection schema 和 physical schema mapping 都指向该 namespace，清理时删除整个测试 schema。
+- schema-enabled smoke 不在 default namespace 创建、读取或删除测试对象。
 
 验收标准：
 
 - `sqlmesh plan` 成功。
 - `sqlmesh apply` 成功。
 - 配置的 MaxCompute project 下生成预期表/视图；no-schema project 中对象名按 `schema__table` 折叠。
+- schema-enabled project 中，即使 PyODPS tenant detection 返回 false，显式 connection `schema` 仍保持 schema-qualified 对象语义。
 - 对受支持模型重复执行同一 apply 具备幂等性。
 - 分区增量模型确认走 `INSERT OVERWRITE TABLE ... PARTITION (...)`。
 - 真实数据验证分区列未错位，分区值落入预期分区。
@@ -528,7 +534,6 @@ adapter 应遵循以下原则：
 - 经能力验证后支持更多模型类型。
 - 更丰富的 MaxCompute 认证模式。
 - MaxQA/MCQA execution mode。
-- schema namespace enabled project 的真实端到端 smoke。
 
 ## 14. 测试计划
 
@@ -598,6 +603,7 @@ DML 渲染：
 - 重复 apply 不产生非预期变更。
 - 失败运行可清理并重跑。
 - no-schema namespace 项目不发送非法 `CREATE SCHEMA`，对象名按 `schema__table` 规则折叠。
+- schema-enabled smoke 必须通过 `MAXCOMPUTE_SCHEMA_SMOKE` 显式启用，并仅操作随机隔离 schema，不能触碰 default namespace。
 
 ## 15. 风险与缓解
 
@@ -610,7 +616,7 @@ DML 渲染：
 | 非事务执行 | 失败后可能留下部分对象 | 优先使用幂等 DDL 和分区 overwrite，并文档化非原子区域 |
 | PyODPS DBAPI cursor 行为与 SQLMesh 假设不一致 | 运行时失败 | metadata 使用 PyODPS object API；Phase 2 用真实环境验证执行 |
 | 类型映射存在边界缺口 | 少数复杂类型解析错误 | PyODPS `odps_type.name` 可覆盖 decimal/array/map 等常见复杂类型；继续用真实 schema fixture 补边界 |
-| schema/project 语义因 MaxCompute 环境差异而变化 | 对象解析错误 | 将 `project` 视为 catalog；schema namespace 关闭时折叠对象名；no-schema 路径已用真实账号验证 |
+| schema/project 语义因 MaxCompute 环境差异而变化 | 对象解析错误 | 将 `project` 视为 catalog；显式 connection `schema` 强制启用 schema 语义；无显式 schema 且 tenant detection 为 false 时折叠对象名；两条路径均已用真实账号验证 |
 | 增量模型未与分区对齐或未路由到分区 overwrite | overwrite 语义不安全 | 明确文档化仅支持面向分区的增量路径，并在 Phase 2 验证实际路由 |
 
 ## 16. 验收标准
@@ -628,6 +634,7 @@ DML 渲染：
 - 单元测试覆盖第一版能力契约。
 - 真实 MaxCompute smoke test 验证端到端执行。
 - no-schema namespace project 下 `Context.plan()` + repeated `Context.apply()` 成功。
+- schema-enabled `york_fic` project 下，使用随机隔离 schema 的 `Context.plan()` + repeated `Context.apply()` 成功，且 default namespace 未被触碰。
 
 ## 17. 开放问题
 
@@ -635,4 +642,3 @@ DML 渲染：
 - `execution_mode = "maxqa"` / MCQA 需要不同的 PyODPS execution path；当前配置层拒绝该模式。
 - struct 等复杂 MaxCompute 类型已有基础单测覆盖，但仍需要真实 schema fixture 扩展边界。
 - `lifecycle` 除了从 `physical_properties/table_properties` 抽取外，是否还需要专用模型属性。
-- schema namespace enabled project 需要补充真实端到端 smoke。

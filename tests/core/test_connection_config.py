@@ -1,6 +1,7 @@
 import base64
 import re
 import typing as t
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1391,6 +1392,37 @@ def test_maxcompute_connection_config(make_config):
     assert kwargs["hints"] == {"odps.sql.allow.fullscan": "true"}
     assert kwargs["quota_name"] == "default"
     assert "security_token" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("schema", "schema_namespace_configured"),
+    [("analytics", True), ("", False), (None, False)],
+)
+def test_maxcompute_connection_factory_marks_configured_schema(
+    make_config, schema: t.Optional[str], schema_namespace_configured: bool
+) -> None:
+    connection = SimpleNamespace()
+    odps_connect = MagicMock(return_value=connection)
+    odps_module = ModuleType("odps")
+    odps_dbapi_module = ModuleType("odps.dbapi")
+    odps_dbapi_module.connect = odps_connect  # type: ignore[attr-defined]
+    odps_module.dbapi = odps_dbapi_module  # type: ignore[attr-defined]
+    config = make_config(
+        type="maxcompute",
+        project="warehouse",
+        schema=schema,
+        endpoint="https://service.cn-hangzhou.maxcompute.aliyun.com/api",
+        access_key_id="ak",
+        access_key_secret="sk",
+        check_import=False,
+    )
+
+    with patch.dict("sys.modules", {"odps": odps_module, "odps.dbapi": odps_dbapi_module}):
+        result = config._connection_factory_with_kwargs()
+
+    assert result is connection
+    assert connection._sqlmesh_schema_namespace_configured is schema_namespace_configured
+    odps_connect.assert_called_once()
 
 
 def test_maxcompute_rejects_maxqa_execution_mode(make_config):

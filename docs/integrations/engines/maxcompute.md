@@ -62,11 +62,13 @@ gateways:
 
 `security_token` enables STS authentication and is passed to PyODPS as an `StsAccount`. `tunnel_endpoint` is optional and is forwarded to `ODPS(...)` for projects that require an explicit tunnel service endpoint.
 
+Setting `schema` explicitly opts the connection into schema namespace behavior. This applies even when PyODPS tenant detection reports that schema namespace is disabled.
+
 The first version uses the PyODPS DBAPI offline execution path. Keep `execution_mode` set to `offline`; MaxQA/MCQA execution requires a different cursor execution path and is outside this version.
 
 ## Schema Namespace Behavior
 
-MaxCompute projects may or may not have schema namespace enabled. The adapter checks `odps.is_schema_namespace_enabled()` at runtime.
+MaxCompute projects may or may not have schema namespace enabled. The adapter treats schema namespace as enabled when either PyODPS tenant detection (`odps.is_schema_namespace_enabled()`) returns true or the connection has an explicit `schema`. An explicit connection schema therefore takes precedence when tenant detection returns false. If tenant detection fails, the adapter also defaults to schema-enabled behavior to avoid silently folding names that should remain schema-qualified.
 
 When schema namespace is enabled, SQLMesh logical schemas render as MaxCompute schemas:
 
@@ -74,7 +76,7 @@ When schema namespace is enabled, SQLMesh logical schemas render as MaxCompute s
 CREATE TABLE `analytics`.`dim_customer` ...
 ```
 
-When schema namespace is disabled, the adapter does not send `CREATE SCHEMA` or `DROP SCHEMA`. It folds SQLMesh logical schemas into object names with a double underscore:
+When schema namespace is disabled and the connection does not specify `schema`, the adapter does not send `CREATE SCHEMA` or `DROP SCHEMA`. It folds SQLMesh logical schemas into object names with a double underscore:
 
 ```sql
 analytics.dim_customer -> analytics__dim_customer
@@ -86,7 +88,7 @@ The same rule applies to physical snapshot objects. For a logical model `analyti
 sqlmesh__analytics__analytics__fact_order_daily__<version>
 ```
 
-For no-schema projects, map the logical schema to the MaxCompute project so SQLMesh does not try to create a physical schema:
+For no-schema projects, omit `schema` from the connection and map the logical schema to the MaxCompute project so SQLMesh does not try to create a physical schema:
 
 ```yaml
 physical_schema_mapping:
@@ -172,4 +174,26 @@ export MAXCOMPUTE_ACCESS_KEY_SECRET=...
 pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py -v
 ```
 
-The smoke test uses DuckDB for SQLMesh state and validates `Context.plan()` plus repeated `Context.apply()` against a no-schema MaxCompute project. It skips automatically when credentials are not configured or when the target project has schema namespace enabled.
+With credentials alone, the no-schema smoke uses a single DuckDB file for SQLMesh state and validates `Context.plan()` plus repeated `Context.apply()`. It skips when the target project has schema namespace enabled.
+
+The schema-enabled smoke performs schema DDL and must be explicitly enabled:
+
+```bash
+export MAXCOMPUTE_SCHEMA_SMOKE=1
+
+pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_smoke_plan_apply -v
+```
+
+This smoke first verifies that schemas can be listed, then creates an isolated random schema named `sqlmesh_smoke_<random>`. Both the connection schema and physical schema mapping point to that namespace. The test runs `Context.plan()` and repeated `Context.apply()`, reads the resulting FULL and partitioned incremental models, and removes the schema afterward. It never creates test objects in the default namespace. This schema-enabled workflow has passed against the real `york_fic` project, including the case where PyODPS tenant detection returned false while the connection specified the random schema.
+
+The lifecycle smoke is also gated and is restricted to the pre-created, schema-enabled `york_fic.sqlmesh` namespace:
+
+```bash
+export MAXCOMPUTE_PROJECT=york_fic
+export MAXCOMPUTE_SCHEMA=sqlmesh
+export MAXCOMPUTE_LIFECYCLE_SMOKE=1
+
+pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_lifecycle_restate_janitor -v
+```
+
+This workflow has passed against the real `york_fic.sqlmesh` namespace. It uses one local DuckDB state file, not SQLite, and verifies idempotent `Context.plan()` and `Context.apply()`, a manual restatement, `auto_restatement_cron` processing through `Context.run()`, the production run invoking the janitor, development environment invalidation followed by a scoped janitor run, expired snapshot table and state cleanup, a repeated idempotent janitor run, and the MaxCompute `LIFECYCLE` metadata on source and physical tables. It does not execute `Context.destroy()`.

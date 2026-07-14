@@ -2,26 +2,28 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` to implement this plan task-by-task. The implementing AI must complete all tasks in one pass, summarize the result, and then wait for Claude to perform code review. Do not create a worktree; make changes on the current branch.
 
-## Current Implementation Status（2026-06-28）
+## Current Implementation Status（2026-07-14）
 
 This plan has been implemented on the current branch. The original TDD task breakdown is kept below for traceability; this status section records the effective behavior of the latest code.
 
 - Implemented `MaxComputeEngineAdapter`, `MaxComputeConnectionConfig`, adapter registration, local `maxcompute` dialect alias, optional `pyodps` dependency, pytest marker, and user docs.
 - Implemented DDL/DML paths for `CREATE/DROP SCHEMA`, `CREATE/DROP TABLE`, `CREATE OR REPLACE VIEW`, `CTAS`, `INSERT INTO`, unpartitioned `INSERT OVERWRITE TABLE`, and partitioned `INSERT OVERWRITE TABLE ... PARTITION (...)`.
 - Implemented MaxCompute no-schema namespace handling: `CREATE/DROP SCHEMA` no-op, logical schema folded into object names as `schema__table`, physical table names folded the same way, and PyODPS metadata calls use `project=...` with `schema=None`.
+- Implemented effective schema namespace detection: an explicit connection `schema` enables schema-qualified behavior even when PyODPS tenant detection returns false.
 - Implemented PyODPS metadata paths for `columns`, `table_exists`, and `_get_data_objects`; no `DESCRIBE` text parsing is used.
 - Implemented `lifecycle` extraction from table properties and rendering as `LIFECYCLE n`.
 - Implemented projection reordering by moving existing select expressions, preserving computed aliases such as `price * quantity AS amount`.
 - Implemented non-partitioned FULL overwrite without a MaxCompute overwrite column list, matching positional overwrite semantics.
 - Implemented `where` handling through SQLMesh projection/filter wrapping so alias filters are applied outside the projected subquery.
 - Implemented a gated real MaxCompute no-schema `Context.plan()` + repeated `Context.apply()` smoke test using DuckDB state.
+- Implemented and passed a real `york_fic` schema-enabled `Context.plan()` + repeated `Context.apply()` smoke. It requires `MAXCOMPUTE_SCHEMA_SMOKE` opt-in, uses a random isolated `sqlmesh_smoke_<random>` schema, and never touches the default namespace.
 
 Known boundaries in the latest code:
 
 - `execution_mode` is currently `Literal["offline"]`; `maxqa` / MCQA is intentionally rejected.
 - `partitioned_by` only accepts simple column references; transform partitions such as `DATE(ds)` are rejected.
 - MaxCompute state sync, Python models, pandas DataFrame writes, materialized views, SCD Type 2, grants, and atomic full table replacement remain out of scope.
-- The real integration smoke currently covers no-schema namespace projects. Schema namespace enabled projects retain code support but still need a dedicated real smoke.
+- Real integration smoke coverage includes both no-schema and schema-enabled behavior. Schema-enabled coverage is deliberately opt-in because it creates and drops an isolated schema.
 
 **Goal:** Add a built-in SQLMesh `maxcompute` execution adapter that can plan and apply supported offline SQL models against Alibaba Cloud MaxCompute/ODPS while keeping SQLMesh state in an external state backend.
 
@@ -1652,10 +1654,11 @@ MAXCOMPUTE_PROJECT=... \
 MAXCOMPUTE_ENDPOINT=... \
 MAXCOMPUTE_ACCESS_KEY_ID=... \
 MAXCOMPUTE_ACCESS_KEY_SECRET=... \
-.venv312/bin/python -m pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py -v
+MAXCOMPUTE_SCHEMA_SMOKE=1 \
+.venv312/bin/python -m pytest tests/core/engine_adapter/integration/test_integration_maxcompute.py::test_maxcompute_schema_smoke_plan_apply -v
 ```
 
-The real smoke validates a no-schema MaxCompute project, skips schema namespace enabled projects, runs `Context.plan(no_prompts=True)`, applies once, applies a second plan for idempotency, and reads back the folded objects named `analytics__<model>`.
+The real smoke suite validates both namespace modes. The no-schema case reads back folded objects named `analytics__<model>`. The opt-in schema-enabled case has passed on `york_fic`: it creates a random `sqlmesh_smoke_<random>` schema, configures both the connection and physical mapping to use it, runs `Context.plan(no_prompts=True)` and repeated `Context.apply()`, verifies FULL and partitioned incremental data, and drops the isolated schema. It does not operate on the default namespace. This also verifies that an explicit connection schema enables schema behavior when PyODPS tenant detection returns false.
 
 ## Execution Recommendation Order
 
@@ -1678,7 +1681,6 @@ The real smoke validates a no-schema MaxCompute project, skips schema namespace 
 
 ## Remaining Follow-Ups
 
-1. Add a real smoke test for schema namespace enabled MaxCompute projects.
-2. Validate `CREATE OR REPLACE VIEW` across more MaxCompute project configurations; add drop/create fallback only if a real target requires it.
-3. Expand real schema/type fixtures for nested `struct`, `array`, and `map` edge cases.
-4. Design MCQA/MaxQA execution separately from the current PyODPS offline DBAPI path.
+1. Validate `CREATE OR REPLACE VIEW` across more MaxCompute project configurations; add drop/create fallback only if a real target requires it.
+2. Expand real schema/type fixtures for nested `struct`, `array`, and `map` edge cases.
+3. Design MCQA/MaxQA execution separately from the current PyODPS offline DBAPI path.

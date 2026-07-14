@@ -2499,7 +2499,9 @@ class MaxComputeConnectionConfig(ConnectionConfig):
         def connect(*args: t.Any, **kwargs: t.Any) -> t.Any:
             from odps.dbapi import connect as odps_connect
 
-            return odps_connect(*args, **kwargs)
+            connection = odps_connect(*args, **kwargs)
+            connection._sqlmesh_schema_namespace_configured = bool(self.schema_)
+            return connection
 
         return connect
 
