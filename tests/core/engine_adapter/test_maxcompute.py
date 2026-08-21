@@ -67,6 +67,16 @@ def test_maxcompute_adapter_capabilities(adapter: MaxComputeEngineAdapter) -> No
     assert isinstance(adapter, RowDiffMixin)
 
 
+def test_maxcompute_get_current_catalog_uses_odps_project(
+    adapter: MaxComputeEngineAdapter,
+) -> None:
+    adapter.connection.odps = SimpleNamespace(project="connection_project")
+    adapter._default_catalog = "configured_project"
+
+    assert adapter.get_current_catalog() == "connection_project"
+    assert adapter.default_catalog == "configured_project"
+
+
 def test_maxcompute_connection_config_passes_hints_to_adapter() -> None:
     config = make_config(
         type="maxcompute",

@@ -69,6 +69,9 @@ class MaxComputeEngineAdapter(RowDiffMixin):
     def odps(self) -> t.Any:
         return self.connection.odps
 
+    def get_current_catalog(self) -> t.Optional[str]:
+        return self.odps.project
+
     def _is_schema_namespace_enabled(self) -> bool:
         try:
             if vars(self.connection).get("_sqlmesh_schema_namespace_configured", False):
